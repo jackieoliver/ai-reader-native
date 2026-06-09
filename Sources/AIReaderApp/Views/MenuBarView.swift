@@ -24,101 +24,19 @@ struct MenuBarView: View {
 
       Divider()
 
-      Section("Quick Actions") {
-        actionButton(.read)
-        actionButton(.summarizeAndRead)
-        actionButton(.pauseResume)
-        actionButton(.stop)
-      }
+      quickActionsSection
 
       Divider()
 
-      Menu("Speed") {
-        Button("1.5x") {}
-      }
-      .disabled(voiceProvider == VoiceProvider.cartesia.rawValue)
-
-      Menu("Volume") {
-        ForEach(volumeOptions, id: \.self) { volume in
-          Button(selectedTitle(volumeTitle(volume), isSelected: volumeMultiplier == volume)) {
-            volumeMultiplier = volume
-          }
-        }
-      }
-
-      Menu("Voice") {
-        Menu("Provider") {
-          Button(selectedTitle(VoiceProvider.cartesia.rawValue, isSelected: voiceProvider == VoiceProvider.cartesia.rawValue)) {
-            voiceProvider = VoiceProvider.cartesia.rawValue
-          }
-        }
-
-        Menu("Model") {
-          ForEach(CartesiaSpeechModel.allCases) { model in
-            Button(selectedTitle(model.title, isSelected: voiceModel == model.rawValue)) {
-              voiceModel = model.rawValue
-              controller.selectCartesiaModel(model)
-            }
-          }
-        }
-
-        Menu("Gender") {
-          ForEach(VoiceGender.allCases) { gender in
-            Button(selectedTitle(gender.rawValue, isSelected: voiceGender == gender.rawValue)) {
-              voiceGender = gender.rawValue
-            }
-          }
-        }
-
-        Menu("Voice") {
-          if controller.cartesiaVoices.isEmpty {
-            Text(controller.cartesiaVoicesLoading ? "Loading Cartesia Voices..." : "Cartesia Voices Auto-Load")
-              .foregroundStyle(.secondary)
-          } else {
-            ForEach(controller.cartesiaVoices.prefix(12)) { voice in
-              Button(selectedTitle(voice.displayName, isSelected: voiceSelection == voice.id)) {
-                voiceSelection = voice.id
-                controller.selectCartesiaVoice(voice)
-              }
-            }
-          }
-          Button("Refresh Cartesia List") {
-            controller.refreshCartesiaVoices(
-              gender: VoiceGender(rawValue: voiceGender),
-              language: controller.providerConfiguration.cartesiaLanguage
-            )
-          }
-        }
-      }
+      speedMenu
+      volumeMenu
+      voiceMenu
 
       Button("Clear History") {
         SummaryWindowPresenter.shared.clearHistory()
       }
 
-      Menu("Summary") {
-        Menu("Type") {
-          ForEach(summaryTypes) { type in
-            Button(selectedTitle(type.title, isSelected: summaryType == type.id)) {
-              summaryType = type.id
-            }
-          }
-        }
-
-        Menu("Model") {
-          ForEach(AnthropicModel.allCases) { model in
-            Button(selectedTitle(model.title, isSelected: summaryModel == model.rawValue)) {
-              summaryModel = model.rawValue
-              controller.selectAnthropicModel(model)
-            }
-          }
-        }
-
-        Toggle("History", isOn: $summaryHistoryEnabled)
-
-        Button("Open Prompts Folder") {
-          NSWorkspace.shared.open(AIReaderPaths.promptsDirectoryURL())
-        }
-      }
+      summaryMenu
 
       Divider()
 
@@ -126,29 +44,7 @@ struct MenuBarView: View {
         controller.openAPIKeysWindow()
       }
 
-      Menu("Settings") {
-        Toggle(
-          "Launch at Login",
-          isOn: Binding(
-            get: { launchAtLoginEnabled },
-            set: setLaunchAtLogin
-          )
-        )
-        .disabled(!launchAtLoginCanChange)
-
-        if let launchAtLoginMessage {
-          Text(launchAtLoginMessage)
-            .foregroundStyle(.secondary)
-        }
-
-        Button("Permissions...") {
-          controller.openPermissionDashboardWindow()
-        }
-
-        Button("Shortcuts...") {
-          controller.openPreferencesWindow()
-        }
-      }
+      settingsMenu
 
       Divider()
 
@@ -173,6 +69,133 @@ struct MenuBarView: View {
         gender: VoiceGender(rawValue: voiceGender),
         language: controller.providerConfiguration.cartesiaLanguage
       )
+    }
+  }
+
+  private var quickActionsSection: some View {
+    Section("Quick Actions") {
+      actionButton(.read)
+      actionButton(.summarizeAndRead)
+      actionButton(.pauseResume)
+      actionButton(.stop)
+    }
+  }
+
+  private var speedMenu: some View {
+    Menu("Speed") {
+      Button("1.5x") {}
+    }
+    .disabled(voiceProvider == VoiceProvider.cartesia.rawValue)
+  }
+
+  private var volumeMenu: some View {
+    Menu("Volume") {
+      ForEach(volumeOptions, id: \.self) { volume in
+        Button(selectedTitle(volumeTitle(volume), isSelected: volumeMultiplier == volume)) {
+          volumeMultiplier = volume
+        }
+      }
+    }
+  }
+
+  private var voiceMenu: some View {
+    Menu("Voice") {
+      Menu("Provider") {
+        Button(selectedTitle(VoiceProvider.cartesia.rawValue, isSelected: voiceProvider == VoiceProvider.cartesia.rawValue)) {
+          voiceProvider = VoiceProvider.cartesia.rawValue
+        }
+      }
+
+      Menu("Model") {
+        ForEach(CartesiaSpeechModel.allCases) { model in
+          Button(selectedTitle(model.title, isSelected: voiceModel == model.rawValue)) {
+            voiceModel = model.rawValue
+            controller.selectCartesiaModel(model)
+          }
+        }
+      }
+
+      Menu("Gender") {
+        ForEach(VoiceGender.allCases) { gender in
+          Button(selectedTitle(gender.rawValue, isSelected: voiceGender == gender.rawValue)) {
+            voiceGender = gender.rawValue
+          }
+        }
+      }
+
+      cartesiaVoiceMenu
+    }
+  }
+
+  private var cartesiaVoiceMenu: some View {
+    Menu("Voice") {
+      if controller.cartesiaVoices.isEmpty {
+        Text(controller.cartesiaVoicesLoading ? "Loading Cartesia Voices..." : "Cartesia Voices Auto-Load")
+          .foregroundStyle(.secondary)
+      } else {
+        ForEach(controller.cartesiaVoices.prefix(12)) { voice in
+          Button(selectedTitle(voice.displayName, isSelected: voiceSelection == voice.id)) {
+            voiceSelection = voice.id
+            controller.selectCartesiaVoice(voice)
+          }
+        }
+      }
+      Button("Refresh Cartesia List") {
+        controller.refreshCartesiaVoices(
+          gender: VoiceGender(rawValue: voiceGender),
+          language: controller.providerConfiguration.cartesiaLanguage
+        )
+      }
+    }
+  }
+
+  private var summaryMenu: some View {
+    Menu("Summary") {
+      Menu("Type") {
+        ForEach(summaryTypes) { type in
+          Button(selectedTitle(type.title, isSelected: summaryType == type.id)) {
+            summaryType = type.id
+          }
+        }
+      }
+
+      Menu("Model") {
+        ForEach(AnthropicModel.allCases) { model in
+          Button(selectedTitle(model.title, isSelected: summaryModel == model.rawValue)) {
+            summaryModel = model.rawValue
+            controller.selectAnthropicModel(model)
+          }
+        }
+      }
+
+      Toggle("History", isOn: $summaryHistoryEnabled)
+
+      Button("Open Prompts Folder") {
+        NSWorkspace.shared.open(AIReaderPaths.promptsDirectoryURL())
+      }
+    }
+  }
+
+  @ViewBuilder
+  private var settingsMenu: some View {
+    Menu("Settings") {
+      Button(selectedTitle("Launch at Login", isSelected: launchAtLoginEnabled)) {
+        setLaunchAtLogin(!launchAtLoginEnabled)
+      }
+      .disabled(!launchAtLoginCanChange)
+
+      if let launchAtLoginMessage {
+        Text(launchAtLoginMessage)
+          .foregroundStyle(.secondary)
+      }
+
+      Button("Permissions...") {
+        controller.openPermissionDashboardWindow()
+      }
+
+      Button("Shortcuts...") {
+        controller.openPreferencesWindow()
+      }
     }
   }
 

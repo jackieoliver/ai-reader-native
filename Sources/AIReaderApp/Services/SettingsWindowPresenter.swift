@@ -123,7 +123,7 @@ final class SettingsWindowPresenter: NSObject, NSWindowDelegate {
 
   private static func displayVersion(_ rawVersion: String?) -> String {
     let version = rawVersion?.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard let version, !version.isEmpty else { return "0.1.0" }
+    guard let version, !version.isEmpty else { return "1.0.0" }
     return version.split(separator: "-", maxSplits: 1).first.map(String.init) ?? version
   }
 
