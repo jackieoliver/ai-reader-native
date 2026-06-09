@@ -121,8 +121,8 @@ public enum ProviderConfigurationError: LocalizedError, Equatable, Sendable {
 
 public enum ProviderConfiguration {
   public static let defaultCartesiaModel = CartesiaSpeechModel.defaultValue.rawValue
-  public static let defaultCartesiaVoiceID = "f786b574-daa5-4673-aa0c-cbe3e8534c02"
-  public static let defaultCartesiaVoiceName = "Katie"
+  public static let defaultCartesiaVoiceID = "db6b0ed5-d5d3-463d-ae85-518a07d3c2b4"
+  public static let defaultCartesiaVoiceName = "Skylar"
   public static let defaultCartesiaLanguage = "en"
   public static let defaultCartesiaVersion = "2026-03-01"
   public static let defaultAnthropicModel = AnthropicModel.defaultValue.rawValue

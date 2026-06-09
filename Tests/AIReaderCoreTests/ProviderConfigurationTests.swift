@@ -45,6 +45,12 @@ final class ProviderConfigurationTests: XCTestCase {
     XCTAssertTrue(values.readyForSummary)
   }
 
+  func testDefaultCartesiaVoiceIsSkylar() {
+    XCTAssertEqual(ProviderConfiguration.defaultCartesiaModel, "sonic-3.5")
+    XCTAssertEqual(ProviderConfiguration.defaultCartesiaVoiceName, "Skylar")
+    XCTAssertEqual(ProviderConfiguration.defaultCartesiaVoiceID, "db6b0ed5-d5d3-463d-ae85-518a07d3c2b4")
+  }
+
   func testRequireAnthropicConfigurationUsesDefaults() throws {
     let envURL = try temporaryEnv(
       """
