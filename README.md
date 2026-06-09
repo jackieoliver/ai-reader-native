@@ -15,8 +15,8 @@ Default local shortcuts:
 The live flow uses the clipboard. Select text, copy it, then trigger AI Reader:
 
 - Double Control reads the current clipboard text, splits it into phrase-sized segments, streams those segments to the selected Cartesia Sonic model over warm WebSocket continuations at fixed 1.5x speed, and starts playback as audio chunks arrive.
-- Summarize reads the current clipboard text, streams it to Claude with `summary.md` as the system prompt, then shows summary text as it arrives in a reusable chat window.
-- Control Option reads the current clipboard text, streams it to Claude with `summary.md` as the system prompt, shows summary text as it arrives in the same reusable chat window, then feeds summary chunks into the selected Cartesia Sonic model with WebSocket continuations.
+- Summarize reads the current clipboard text, streams it to Claude with the selected prompt style from the `prompts/` folder as the system prompt, then shows summary text as it arrives in a reusable chat window.
+- Control Option reads the current clipboard text, streams it to Claude with the selected prompt style from the `prompts/` folder as the system prompt, shows summary text as it arrives in the same reusable chat window, then feeds summary chunks into the selected Cartesia Sonic model with WebSocket continuations.
 
 AI Reader requests Accessibility only for the keyboard event tap used by shortcuts. Clipboard text capture does not use Accessibility.
 
@@ -30,7 +30,7 @@ flowchart TD
   B -->|"Control Option"| D
   C --> E1["Direct text chunks<br/>Cartesia WebSocket continuations"]
   E1 --> E["Cartesia /tts/websocket<br/>model: sonic-3.5 or sonic-3<br/>voice: selected voice ID<br/>speed 1.5 + volume: generation_config"]
-  D --> F["Claude Messages API<br/>system prompt: summary.md"]
+  D --> F["Claude Messages API<br/>system prompt: selected prompts/ style"]
   F --> G["Claude streaming summary"]
   G --> S["Singleton summary chat window<br/>summary streams as first Claude message"]
   S --> T["Follow-up questions to Claude<br/>summary stays as chat context"]
