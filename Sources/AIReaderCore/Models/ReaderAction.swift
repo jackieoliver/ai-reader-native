@@ -44,8 +44,6 @@ public enum ReaderAction: String, CaseIterable, Identifiable, Sendable {
       return "Ctrl+Opt"
     case .pauseResume:
       return "Ctrl+S"
-    case .stop:
-      return "Ctrl+B"
     case .rewind:
       return "Ctrl+A"
     case .fastForward:

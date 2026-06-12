@@ -29,14 +29,22 @@ final class ReaderController: ObservableObject {
   private let cartesiaVoiceService = CartesiaVoiceService()
   private let audioPlayback = AudioPlaybackService()
   private var permissionObservationTask: Task<Void, Never>?
-  private var pipelineTask: Task<Void, Never>?
+  private var currentPipeline: Task<Void, Never>?
+  private var pendingPipelineWork: (@MainActor () async -> Void)?
+  private var pipelineStartWorker: Task<Void, Never>?
   private var readySettleTask: Task<Void, Never>?
   private var voiceTask: Task<Void, Never>?
   private var warmCartesiaTask: Task<Void, Never>?
   private var lastWarmCartesiaConfiguration: CartesiaConfiguration?
   private var lastVoiceLoadRequest: CartesiaVoiceLoadRequest?
+  private var pauseTeardownTask: Task<Void, Never>?
+  private var pipelineEpoch = 0
+  private var lastCapturedText: String?
+  private var lastSummaryWasSpoken = true
   private let streamingSampleRate = 44_100
   private let targetFirstAudioMS = 50.0
+  private static let preemptionGraceMilliseconds = 250
+  private static let pauseTeardownSeconds: TimeInterval = 120
 
   init() {
     PreferenceKeys.migrateDefaultSummaryPromptSelectionIfNeeded()
@@ -66,6 +74,20 @@ final class ReaderController: ObservableObject {
     }
     refreshShellState()
     try? audioPlayback.warmUpStreaming(sampleRate: streamingSampleRate)
+    audioPlayback.onStreamingPlaybackFinished = { [weak self] in
+      self?.streamingPlaybackDidFinish()
+    }
+
+    let chatState = SummaryWindowPresenter.shared.chatState
+    chatState.onSendChat = { [weak self] input, messageID in
+      self?.performChatFollowUp(input, messageID: messageID)
+    }
+    chatState.onSpeakText = { [weak self] text in
+      self?.speakText(text)
+    }
+    chatState.onPromptTypeChanged = { [weak self] in
+      self?.summaryPromptTypeDidChange()
+    }
   }
 
   var shellReady: Bool {
@@ -75,10 +97,16 @@ final class ReaderController: ObservableObject {
   deinit {
     hotkeyMonitor.stop()
     permissionObservationTask?.cancel()
-    pipelineTask?.cancel()
+    pipelineStartWorker?.cancel()
+    currentPipeline?.cancel()
     readySettleTask?.cancel()
+    pauseTeardownTask?.cancel()
     voiceTask?.cancel()
     warmCartesiaTask?.cancel()
+    let speechService = cartesiaRealtimeSpeech
+    Task {
+      await speechService.close()
+    }
   }
 
   func perform(_ action: ReaderAction) {
@@ -88,20 +116,22 @@ final class ReaderController: ObservableObject {
 
     switch action {
     case .read:
-      startPipeline(.readClipboard, triggeredAt: triggeredAt)
+      handleCaptureTrigger(.readClipboard, triggeredAt: triggeredAt)
     case .summarize:
-      startPipeline(.summarizeClipboard, triggeredAt: triggeredAt)
+      handleCaptureTrigger(.summarizeClipboard, triggeredAt: triggeredAt)
     case .summarizeAndRead:
-      startPipeline(.summarizeClipboardThenRead, triggeredAt: triggeredAt)
+      handleCaptureTrigger(.summarizeClipboardThenRead, triggeredAt: triggeredAt)
     case .pauseResume:
       switch audioPlayback.pauseOrResume() {
       case .resumed:
+        cancelPauseTeardown()
         status = .reading
         message = "Playback resumed."
         settleBackToReadyForCurrentPlayback()
       case .paused:
         status = .paused
-        message = "Playback paused."
+        message = "Playback paused. Closes after 2 minutes."
+        schedulePauseTeardown()
       case .unavailable:
         message = "No active audio to pause."
       }
@@ -111,31 +141,28 @@ final class ReaderController: ObservableObject {
       let result = audioPlayback.skip(by: -10)
       message = playbackSeekMessage(result, fallback: "Rewound 10 seconds.")
       settleBackToReadyIfPlaying(result)
+      refreshPauseTeardownIfPaused()
     case .fastForward:
       let result = audioPlayback.skip(by: 10)
       message = playbackSeekMessage(result, fallback: "Forwarded 10 seconds.")
       settleBackToReadyIfPlaying(result)
+      refreshPauseTeardownIfPaused()
     case .startFromBeginning:
       let result = audioPlayback.startFromBeginning()
       message = playbackSeekMessage(result, fallback: "Started from the beginning.")
       settleBackToReadyIfPlaying(result)
+      refreshPauseTeardownIfPaused()
     case .replay:
-      do {
-        status = .reading
-        message = "Replaying last audio."
-        let duration = try audioPlayback.replay()
-        settleBackToReady(from: .reading, after: duration)
-      } catch {
-        status = .failed
-        message = error.localizedDescription
-      }
+      replayLastAudio()
     }
   }
 
   func stopPlayback() {
+    pendingPipelineWork = nil
     cancelReadySettle()
-    pipelineTask?.cancel()
-    pipelineTask = nil
+    cancelPauseTeardown()
+    currentPipeline?.cancel()
+    currentPipeline = nil
     audioPlayback.stop()
     status = .ready
     message = "Playback stopped."
@@ -374,10 +401,7 @@ final class ReaderController: ObservableObject {
 
   func testCartesiaVoice() {
     let triggeredAt = LatencyClock.now
-    cancelReadySettle()
-    pipelineTask?.cancel()
-    audioPlayback.stop()
-    pipelineTask = Task { @MainActor [weak self] in
+    requestPipeline { [weak self] in
       guard let self else { return }
       do {
         status = .reading
@@ -405,10 +429,7 @@ final class ReaderController: ObservableObject {
     let sourceText = """
       AI Reader is testing the Claude summary path. The app should send text to Anthropic, receive a concise summary, and display that summary in one reusable macOS window.
       """
-    cancelReadySettle()
-    pipelineTask?.cancel()
-    audioPlayback.stop()
-    pipelineTask = Task { @MainActor [weak self] in
+    requestPipeline { [weak self] in
       guard let self else { return }
       do {
         status = .summarizing
@@ -590,28 +611,327 @@ final class ReaderController: ObservableObject {
     }
   }
 
-  private func startPipeline(_ mode: ReaderPipelineMode, triggeredAt: UInt64) {
-    cancelReadySettle()
-    pipelineTask?.cancel()
-    audioPlayback.stop()
-    pipelineTask = Task { @MainActor [weak self] in
-      await self?.runPipeline(mode, triggeredAt: triggeredAt)
+  private func startPipeline(
+    _ mode: ReaderPipelineMode,
+    sourceText: String,
+    captureMS: Double,
+    triggeredAt: UInt64
+  ) {
+    requestPipeline { [weak self] in
+      await self?.runPipeline(mode, sourceText: sourceText, captureMS: captureMS, triggeredAt: triggeredAt)
     }
   }
 
-  private func runPipeline(_ mode: ReaderPipelineMode, triggeredAt: UInt64) async {
-    do {
-      let captureStart = LatencyClock.now
-      let captured = try textCapture.capture()
-      let captureMS = LatencyClock.milliseconds(from: captureStart, to: LatencyClock.now)
+  /// Single-flight pipeline coordinator. The latest request wins: rapid
+  /// triggers coalesce into one start, and a new run begins only after the
+  /// previous run's teardown has been awaited (bounded by the preemption
+  /// grace period), so two runs never drive the socket or engine at once.
+  private func requestPipeline(_ work: @escaping @MainActor () async -> Void) {
+    cancelReadySettle()
+    cancelPauseTeardown()
+    pendingPipelineWork = work
+    guard pipelineStartWorker == nil else { return }
 
+    pipelineStartWorker = Task { @MainActor [weak self] in
+      defer { self?.pipelineStartWorker = nil }
+      while let next = self?.pendingPipelineWork {
+        guard let self else { return }
+        self.pendingPipelineWork = nil
+        await self.teardownCurrentPipeline()
+        guard self.pendingPipelineWork == nil else { continue }
+        self.launchPipeline(next)
+        return
+      }
+    }
+  }
+
+  private func launchPipeline(_ work: @escaping @MainActor () async -> Void) {
+    pipelineEpoch += 1
+    let epoch = pipelineEpoch
+    currentPipeline = Task { @MainActor [weak self] in
+      await work()
+      guard let self, self.pipelineEpoch == epoch else { return }
+      self.currentPipeline = nil
+    }
+  }
+
+  private func teardownCurrentPipeline() async {
+    guard let pipeline = currentPipeline else {
+      audioPlayback.stop()
+      return
+    }
+    currentPipeline = nil
+    pipeline.cancel()
+    audioPlayback.stop()
+    await awaitPipelineCompletion(pipeline, gracePeriodMilliseconds: Self.preemptionGraceMilliseconds)
+  }
+
+  /// Waits for the superseded run to unwind so the new run can reuse the warm
+  /// socket cleanly. If the old run is wedged past the grace period we proceed
+  /// anyway: the Cartesia actor's cancel watchdog force-closes the socket and
+  /// the next generation self-heals on a fresh connection.
+  private func awaitPipelineCompletion(_ pipeline: Task<Void, Never>, gracePeriodMilliseconds: Int) async {
+    await withTaskGroup(of: Void.self) { group in
+      group.addTask {
+        await pipeline.value
+      }
+      group.addTask {
+        try? await Task.sleep(for: .milliseconds(gracePeriodMilliseconds))
+      }
+      await group.next()
+      group.cancelAll()
+    }
+  }
+
+  /// Captured text persists here until new clipboard text replaces it, so a
+  /// re-trigger never depends on the system clipboard still holding it.
+  /// Empty or unchanged clipboard on a spoken trigger means "hear it again":
+  /// replay the banked audio rather than re-capturing and regenerating.
+  private func handleCaptureTrigger(_ mode: ReaderPipelineMode, triggeredAt: UInt64) {
+    let captureStart = LatencyClock.now
+    let clipboardText = (try? textCapture.capture())?.text
+    let captureMS = LatencyClock.milliseconds(from: captureStart, to: LatencyClock.now)
+
+    if let clipboardText, clipboardText != lastCapturedText {
+      lastCapturedText = clipboardText
+      startPipeline(mode, sourceText: clipboardText, captureMS: captureMS, triggeredAt: triggeredAt)
+      return
+    }
+
+    if mode != .summarizeClipboard, currentPipeline == nil, audioPlayback.hasReplayableAudio {
+      replayLastAudio()
+      return
+    }
+
+    if let sourceText = clipboardText ?? lastCapturedText {
+      startPipeline(mode, sourceText: sourceText, captureMS: captureMS, triggeredAt: triggeredAt)
+      return
+    }
+
+    status = .missingClipboardText
+    message = TextCaptureError.missingClipboardText.localizedDescription
+  }
+
+  private func replayLastAudio() {
+    requestPipeline { [weak self] in
+      guard let self else { return }
+      do {
+        status = .reading
+        message = "Replaying last audio."
+        let duration = try audioPlayback.replay()
+        guard !Task.isCancelled else { return }
+        settleBackToReady(from: .reading, after: duration)
+      } catch is CancellationError {
+        return
+      } catch {
+        status = .failed
+        message = error.localizedDescription
+      }
+    }
+  }
+
+  func speakText(_ text: String) {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return }
+    let triggeredAt = LatencyClock.now
+    requestPipeline { [weak self] in
+      guard let self else { return }
+      do {
+        let cartesia = try ProviderConfiguration.requireReadConfiguration()
+        status = .reading
+        message = "Reading reply aloud."
+        let remainingDuration = try await streamCartesiaTextBySegments(
+          text: trimmed,
+          cartesia: cartesia,
+          triggeredAt: triggeredAt,
+          captureMS: 0,
+          playbackMessage: "Reading reply aloud."
+        )
+        guard !Task.isCancelled else { return }
+        settleBackToReady(from: .reading, after: remainingDuration)
+      } catch is CancellationError {
+        return
+      } catch ProviderConfigurationError.missingKeys(let keys) {
+        status = .failed
+        message = "Missing provider keys: \(keys.joined(separator: ", "))."
+        openAPIKeysWindow()
+      } catch {
+        status = .failed
+        message = await userFacingProviderErrorMessage(error)
+      }
+    }
+  }
+
+  func performChatFollowUp(_ input: AnthropicChatInput, messageID: SummaryChatMessage.ID) {
+    let triggeredAt = LatencyClock.now
+    requestPipeline { [weak self] in
+      guard let self else { return }
+      let chatState = SummaryWindowPresenter.shared.chatState
+      do {
+        status = .summarizing
+        message = "Streaming Claude reply into voice."
+        let remainingDuration = try await streamClaudeToSpeech(
+          input,
+          speak: true,
+          triggeredAt: triggeredAt,
+          initialTiming: SummaryPipelineTiming(captureMS: 0, windowMS: nil),
+          playbackMessage: "Reading Claude reply.",
+          onDelta: { chatState.appendStreamingDelta(to: messageID, $0) },
+          onFinish: { text, statusText in
+            chatState.finishStreamingMessage(
+              id: messageID,
+              text: text,
+              statusText: statusText,
+              asSummaryContext: false
+            )
+          }
+        )
+        guard !Task.isCancelled else { return }
+        settleBackToReady(from: .reading, after: remainingDuration ?? 0.9)
+      } catch is CancellationError {
+        chatState.failStreamingMessage(id: messageID, statusText: "Reply stopped.")
+        return
+      } catch {
+        let failure = await userFacingProviderErrorMessage(error)
+        chatState.failStreamingMessage(id: messageID, statusText: failure)
+        status = .failed
+        message = failure
+      }
+    }
+  }
+
+  /// Switching the summary style regenerates the remembered captured text
+  /// with the new prompt and appends the result to the chat.
+  func summaryPromptTypeDidChange() {
+    let chatState = SummaryWindowPresenter.shared.chatState
+    guard let sourceText = lastCapturedText, chatState.hasSummaryContent else { return }
+    let speak = lastSummaryWasSpoken
+    let triggeredAt = LatencyClock.now
+    requestPipeline { [weak self] in
+      guard let self else { return }
+      do {
+        status = .summarizing
+        message = "Restyling summary."
+        let remainingDuration = try await streamRestyledSummary(
+          from: sourceText,
+          speak: speak,
+          triggeredAt: triggeredAt
+        )
+        guard !Task.isCancelled else { return }
+        if speak {
+          settleBackToReady(from: .reading, after: remainingDuration ?? 0.9)
+        } else {
+          status = .ready
+          message = "Summary restyled."
+        }
+      } catch is CancellationError {
+        return
+      } catch {
+        status = .failed
+        message = await userFacingProviderErrorMessage(error)
+      }
+    }
+  }
+
+  private func streamRestyledSummary(
+    from sourceText: String,
+    speak: Bool,
+    triggeredAt: UInt64
+  ) async throws -> TimeInterval? {
+    let anthropic = try ProviderConfiguration.requireAnthropicConfiguration()
+    let typeID = selectedSummaryTypeID()
+    let prompt = SummaryPrompt.load(typeID: typeID)
+    let styleTitle = SummaryPrompt.prettyTitle(typeID)
+    let chatState = SummaryWindowPresenter.shared.chatState
+    let messageID = chatState.beginStreamingAssistantMessage(marker: "Restyled as \(styleTitle).")
+    SummaryWindowPresenter.shared.showWindowIfNeeded()
+
+    let input = AnthropicChatInput(
+      configuration: anthropic,
+      systemPrompt: prompt,
+      messages: [AnthropicChatMessage(role: .user, content: sourceText)]
+    )
+
+    do {
+      return try await streamClaudeToSpeech(
+        input,
+        speak: speak,
+        triggeredAt: triggeredAt,
+        initialTiming: SummaryPipelineTiming(captureMS: 0, windowMS: nil),
+        playbackMessage: "Reading restyled summary.",
+        onDelta: { chatState.appendStreamingDelta(to: messageID, $0) },
+        onFinish: { text, statusText in
+          chatState.finishStreamingMessage(
+            id: messageID,
+            text: text,
+            statusText: statusText,
+            asSummaryContext: true
+          )
+        }
+      )
+    } catch {
+      chatState.failStreamingMessage(id: messageID, statusText: error.localizedDescription)
+      throw error
+    }
+  }
+
+  private func schedulePauseTeardown() {
+    pauseTeardownTask?.cancel()
+    pauseTeardownTask = Task { @MainActor [weak self] in
+      do {
+        try await Task.sleep(for: .seconds(Self.pauseTeardownSeconds))
+      } catch {
+        return
+      }
+      guard !Task.isCancelled, let self else { return }
+      self.pauseTeardownTask = nil
+      await self.closePausedDictation()
+    }
+  }
+
+  private func cancelPauseTeardown() {
+    pauseTeardownTask?.cancel()
+    pauseTeardownTask = nil
+  }
+
+  private func refreshPauseTeardownIfPaused() {
+    guard status == .paused else { return }
+    schedulePauseTeardown()
+  }
+
+  /// Users treat pause as stop: after a dictation sits paused for two
+  /// minutes, tear the run down fully (Claude stream, TTS context, queued
+  /// buffers) but bank the audio first so Ctrl+Option can still replay it.
+  private func closePausedDictation() async {
+    guard status == .paused else { return }
+    pendingPipelineWork = nil
+    cancelReadySettle()
+    if let pipeline = currentPipeline {
+      currentPipeline = nil
+      pipeline.cancel()
+      await awaitPipelineCompletion(pipeline, gracePeriodMilliseconds: Self.preemptionGraceMilliseconds)
+    }
+    audioPlayback.finishStreaming()
+    audioPlayback.stop()
+    guard status == .paused else { return }
+    status = .ready
+    message = "Paused dictation closed. Press Ctrl+Option to replay it."
+  }
+
+  private func runPipeline(
+    _ mode: ReaderPipelineMode,
+    sourceText: String,
+    captureMS: Double,
+    triggeredAt: UInt64
+  ) async {
+    do {
       switch mode {
       case .readClipboard:
         status = .reading
         message = "Streaming copied text into Cartesia."
         let cartesia = try ProviderConfiguration.requireReadConfiguration()
         let remainingDuration = try await streamCartesiaTextBySegments(
-          text: captured.text,
+          text: sourceText,
           cartesia: cartesia,
           triggeredAt: triggeredAt,
           captureMS: captureMS,
@@ -621,11 +941,12 @@ final class ReaderController: ObservableObject {
         settleBackToReady(from: .reading, after: remainingDuration)
 
       case .summarizeClipboard:
+        lastSummaryWasSpoken = false
         status = .summarizing
         message = "Streaming captured text to Claude."
         _ = try await streamClaudeSummary(
-          from: captured.text,
-          sourceCharacterCount: captured.text.count,
+          from: sourceText,
+          sourceCharacterCount: sourceText.count,
           triggeredAt: triggeredAt,
           captureMS: captureMS,
           speak: false
@@ -636,11 +957,12 @@ final class ReaderController: ObservableObject {
         refreshProviderKeyStatus(anthropicAccepted: true)
 
       case .summarizeClipboardThenRead:
+        lastSummaryWasSpoken = true
         status = .summarizing
         message = "Streaming Claude summary into voice."
         let remainingDuration = try await streamClaudeSummary(
-          from: captured.text,
-          sourceCharacterCount: captured.text.count,
+          from: sourceText,
+          sourceCharacterCount: sourceText.count,
           triggeredAt: triggeredAt,
           captureMS: captureMS,
           speak: true
@@ -648,9 +970,6 @@ final class ReaderController: ObservableObject {
         guard !Task.isCancelled else { return }
         settleBackToReady(from: .reading, after: remainingDuration ?? 0.9)
       }
-    } catch TextCaptureError.missingClipboardText {
-      status = .missingClipboardText
-      message = TextCaptureError.missingClipboardText.localizedDescription
     } catch ProviderConfigurationError.missingKeys(let keys) {
       status = .failed
       message = "Missing provider keys: \(keys.joined(separator: ", "))."
@@ -697,95 +1016,136 @@ final class ReaderController: ObservableObject {
     )
     let windowMS = LatencyClock.milliseconds(from: windowStart, to: LatencyClock.now)
 
-    var timing = SummaryPipelineTiming(captureMS: captureMS, windowMS: windowMS)
-    let cartesiaForSpeech = speak ? try? ProviderConfiguration.requireReadConfiguration() : nil
-    var speechBridge: TextSegmentStreamBridge?
-    var speechTask: Task<TimeInterval, Error>?
-    var speechChunker = StreamingSpeechChunker()
+    let cartesiaAvailable = (try? ProviderConfiguration.requireReadConfiguration()) != nil
+    let remainingDuration = try await streamClaudeToSpeech(
+      summaryInput,
+      speak: speak && cartesiaAvailable,
+      triggeredAt: triggeredAt,
+      initialTiming: SummaryPipelineTiming(captureMS: captureMS, windowMS: windowMS),
+      playbackMessage: "Reading Claude summary.",
+      onDelta: { SummaryWindowPresenter.shared.appendSummaryDelta($0) },
+      onFinish: { text, statusText in
+        SummaryWindowPresenter.shared.finishSummary(text, statusText: statusText)
+      }
+    )
 
-    func startSpeechIfNeeded() -> TextSegmentStreamBridge? {
-      guard speak, let cartesia = cartesiaForSpeech else {
-        return nil
-      }
-      if let speechBridge {
-        return speechBridge
-      }
-
-      status = .reading
-      let bridge = TextSegmentStreamBridge()
-      let speechInitialTiming = timing
-      speechBridge = bridge
-      speechTask = Task { @MainActor [weak self] in
-        guard let self else { return 0.2 }
-        return try await self.streamCartesiaSpeechSegments(
-          textSegments: bridge.stream,
-          cartesia: cartesia,
-          triggeredAt: triggeredAt,
-          timing: speechInitialTiming
-        )
-      }
-      return bridge
+    if speak, !cartesiaAvailable {
+      throw ProviderConfigurationError.missingKeys(["CARTESIA_API_KEY", "CARTESIA_VOICE_ID"])
     }
+    return remainingDuration
+  }
 
-    var summary = ""
-    let requestStart = LatencyClock.now
-    timing.claudeRequestMS = LatencyClock.milliseconds(from: triggeredAt, to: requestStart)
+  /// Streams one Claude response into the summary window (via the supplied
+  /// sinks) and, when speaking, into Cartesia as sentences complete.
+  private func streamClaudeToSpeech(
+    _ input: AnthropicChatInput,
+    speak: Bool,
+    triggeredAt: UInt64,
+    initialTiming: SummaryPipelineTiming,
+    playbackMessage: String,
+    onDelta: @escaping (String) -> Void,
+    onFinish: @escaping (String, String) -> Void
+  ) async throws -> TimeInterval? {
+    var timing = initialTiming
+    timing.claudeRequestMS = LatencyClock.milliseconds(from: triggeredAt, to: LatencyClock.now)
     updateSummaryTiming(timing)
-    if speak {
-      _ = startSpeechIfNeeded()
+
+    guard speak, let cartesia = try? ProviderConfiguration.requireReadConfiguration() else {
+      _ = try await consumeClaudeStream(
+        input,
+        triggeredAt: triggeredAt,
+        timing: &timing,
+        emitSegment: nil,
+        onDelta: onDelta,
+        onFinish: onFinish
+      )
+      return nil
     }
+
+    status = .reading
+    let bridge = TextSegmentStreamBridge()
+    let speechTiming = timing
+    // Structured child: started eagerly so the Cartesia handshake overlaps
+    // Claude's time to first token, and cancelled+awaited automatically if
+    // this scope exits early.
+    async let remainingDuration: TimeInterval = streamCartesiaSpeechSegments(
+      textSegments: bridge.stream,
+      cartesia: cartesia,
+      triggeredAt: triggeredAt,
+      timing: speechTiming,
+      playbackMessage: playbackMessage
+    )
 
     do {
-      let stream = anthropicSummary.stream(summaryInput)
-
-      for try await event in stream {
-        try Task.checkCancellation()
-        switch event {
-        case .responseStarted:
-          timing.claudeResponseMS = LatencyClock.milliseconds(from: triggeredAt, to: LatencyClock.now)
-          updateSummaryTiming(timing)
-
-        case .textDelta(let delta):
-          if timing.claudeFirstTextMS == nil {
-            timing.claudeFirstTextMS = LatencyClock.milliseconds(from: triggeredAt, to: LatencyClock.now)
-          }
-          summary += delta
-          SummaryWindowPresenter.shared.appendSummaryDelta(delta)
-          for segment in speechChunker.append(delta) {
-            startSpeechIfNeeded()?.yield(segment)
-          }
-          updateSummaryTiming(timing)
-
-        case .messageStop:
-          break
-        }
-      }
-
-      for segment in speechChunker.finish() {
-        startSpeechIfNeeded()?.yield(segment)
-      }
-      speechBridge?.finish()
-
-      guard !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-        throw ProviderAPIError.emptyResponse(provider: "Anthropic")
-      }
-
-      timing.claudeDoneMS = LatencyClock.milliseconds(from: triggeredAt, to: LatencyClock.now)
-      SummaryWindowPresenter.shared.finishSummary(summary, statusText: timing.summary)
-      latencyMessage = timing.summary
-      refreshProviderKeyStatus(anthropicAccepted: true)
-
-      if speak, speechTask == nil {
-        throw ProviderConfigurationError.missingKeys(["CARTESIA_API_KEY", "CARTESIA_VOICE_ID"])
-      }
-
-      let remainingDuration = try await speechTask?.value
-      return remainingDuration
+      _ = try await consumeClaudeStream(
+        input,
+        triggeredAt: triggeredAt,
+        timing: &timing,
+        emitSegment: { bridge.yield($0) },
+        onDelta: onDelta,
+        onFinish: onFinish
+      )
+      bridge.finish()
     } catch {
-      speechBridge?.finish(throwing: error)
-      speechTask?.cancel()
+      bridge.finish(throwing: error)
       throw error
     }
+
+    return try await remainingDuration
+  }
+
+  private func consumeClaudeStream(
+    _ summaryInput: AnthropicChatInput,
+    triggeredAt: UInt64,
+    timing: inout SummaryPipelineTiming,
+    emitSegment: ((String) -> Void)?,
+    onDelta: (String) -> Void,
+    onFinish: (String, String) -> Void
+  ) async throws -> String {
+    var summary = ""
+    var speechChunker = StreamingSpeechChunker()
+    let stream = anthropicSummary.stream(summaryInput)
+
+    for try await event in stream {
+      try Task.checkCancellation()
+      switch event {
+      case .responseStarted:
+        timing.claudeResponseMS = LatencyClock.milliseconds(from: triggeredAt, to: LatencyClock.now)
+        updateSummaryTiming(timing)
+
+      case .textDelta(let delta):
+        if timing.claudeFirstTextMS == nil {
+          timing.claudeFirstTextMS = LatencyClock.milliseconds(from: triggeredAt, to: LatencyClock.now)
+        }
+        summary += delta
+        onDelta(delta)
+        if let emitSegment {
+          for segment in speechChunker.append(delta) {
+            emitSegment(segment)
+          }
+        }
+        updateSummaryTiming(timing)
+
+      case .messageStop:
+        break
+      }
+    }
+
+    if let emitSegment {
+      for segment in speechChunker.finish() {
+        emitSegment(segment)
+      }
+    }
+
+    guard !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+      throw ProviderAPIError.emptyResponse(provider: "Anthropic")
+    }
+
+    timing.claudeDoneMS = LatencyClock.milliseconds(from: triggeredAt, to: LatencyClock.now)
+    onFinish(summary, timing.summary)
+    latencyMessage = timing.summary
+    refreshProviderKeyStatus(anthropicAccepted: true)
+    return summary
   }
 
   private func showSummaryWindow(_ summary: String, sourceCharacterCount: Int) {
@@ -982,16 +1342,14 @@ final class ReaderController: ObservableObject {
   ) async throws -> TimeInterval {
     let bridge = TextSegmentStreamBridge()
     let timing = SummaryPipelineTiming(captureMS: captureMS, windowMS: nil)
-    let speechTask = Task { @MainActor [weak self] in
-      guard let self else { return 0.2 }
-      return try await self.streamCartesiaSpeechSegments(
-        textSegments: bridge.stream,
-        cartesia: cartesia,
-        triggeredAt: triggeredAt,
-        timing: timing,
-        playbackMessage: playbackMessage
-      )
-    }
+    // Structured child: cancelled+awaited automatically if this scope exits.
+    async let remainingDuration: TimeInterval = streamCartesiaSpeechSegments(
+      textSegments: bridge.stream,
+      cartesia: cartesia,
+      triggeredAt: triggeredAt,
+      timing: timing,
+      playbackMessage: playbackMessage
+    )
 
     var chunker = StreamingSpeechChunker()
     for segment in chunker.append(text) {
@@ -1002,13 +1360,7 @@ final class ReaderController: ObservableObject {
     }
     bridge.finish()
 
-    do {
-      return try await speechTask.value
-    } catch {
-      bridge.finish(throwing: error)
-      speechTask.cancel()
-      throw error
-    }
+    return try await remainingDuration
   }
 
   private func streamCartesiaSpeechSegments(
@@ -1109,10 +1461,14 @@ final class ReaderController: ObservableObject {
     return "First audio \(LatencyClock.format(firstScheduledMS))ms (\(targetStatus) 50ms, \(connectionText)); \(requestText), \(chunkText), local prep \(LatencyClock.format(audioPreparedMS))ms\(stepText), \(chunkCount) chunks/\(LatencyClock.format(kilobytes))KB."
   }
 
+  /// Safety-net fallback only. The primary "playback finished" signal is
+  /// `streamingPlaybackDidFinish()`, driven by real buffer completion; this
+  /// timer pads generously so status can never stay stuck on `.reading` if
+  /// that event is somehow missed.
   private func settleBackToReady(from expectedStatus: ReaderStatus, after delay: TimeInterval = 0.9) {
     cancelReadySettle()
     readySettleTask = Task { @MainActor [weak self] in
-      let clampedDelay = min(max(delay + 0.25, 0.9), 180)
+      let clampedDelay = min(max(delay + 5, 5), 600)
       do {
         try await Task.sleep(for: .milliseconds(Int(clampedDelay * 1000)))
       } catch {
@@ -1124,6 +1480,13 @@ final class ReaderController: ObservableObject {
       status = .ready
       message = "Ready"
     }
+  }
+
+  private func streamingPlaybackDidFinish() {
+    guard status == .reading else { return }
+    cancelReadySettle()
+    status = .ready
+    message = "Ready"
   }
 
   private func cancelReadySettle() {

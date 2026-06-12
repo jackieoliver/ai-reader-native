@@ -77,7 +77,6 @@ struct MenuBarView: View {
       actionButton(.read)
       actionButton(.summarizeAndRead)
       actionButton(.pauseResume)
-      actionButton(.stop)
     }
   }
 
@@ -153,9 +152,7 @@ struct MenuBarView: View {
     Menu("Summary") {
       Menu("Type") {
         ForEach(summaryTypes) { type in
-          Button(selectedTitle(type.title, isSelected: summaryType == type.id)) {
-            summaryType = type.id
-          }
+          summaryTypeButton(type)
         }
       }
 
@@ -195,6 +192,16 @@ struct MenuBarView: View {
 
       Button("Shortcuts...") {
         controller.openPreferencesWindow()
+      }
+    }
+  }
+
+  private func summaryTypeButton(_ type: SummaryPromptType) -> some View {
+    Button(selectedTitle(type.title, isSelected: summaryType == type.id)) {
+      let changed = summaryType != type.id
+      summaryType = type.id
+      if changed {
+        controller.summaryPromptTypeDidChange()
       }
     }
   }

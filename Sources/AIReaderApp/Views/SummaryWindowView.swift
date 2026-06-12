@@ -13,6 +13,21 @@ final class SummaryWindowState: ObservableObject {
   private let anthropicSummary = AnthropicSummaryService()
   private var summaryContext = ""
   private var activeSummaryMessageID: SummaryChatMessage.ID?
+  private var chatTask: Task<Void, Never>?
+
+  var onSendChat: ((AnthropicChatInput, SummaryChatMessage.ID) -> Void)?
+  var onSpeakText: ((String) -> Void)?
+  var onPromptTypeChanged: (() -> Void)?
+
+  var hasSummaryContent: Bool {
+    !summaryContext.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+  }
+
+  var latestAssistantText: String? {
+    messages.last {
+      $0.role == .assistant && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }?.text
+  }
 
   var summary: String {
     summaryContext
@@ -111,23 +126,91 @@ final class SummaryWindowState: ObservableObject {
     isSending = true
     statusText = "Claude is thinking."
 
-    Task { @MainActor in
-      do {
-        let anthropic = try ProviderConfiguration.requireAnthropicConfiguration()
-        let response = try await anthropicSummary.chat(
-          AnthropicChatInput(
-            configuration: anthropic,
-            systemPrompt: Self.followUpSystemPrompt,
-            messages: anthropicMessages()
-          )
-        )
-        messages.append(SummaryChatMessage(role: .assistant, text: response))
-        statusText = ""
-      } catch {
-        statusText = error.localizedDescription
-      }
+    let input: AnthropicChatInput
+    do {
+      let anthropic = try ProviderConfiguration.requireAnthropicConfiguration()
+      input = AnthropicChatInput(
+        configuration: anthropic,
+        systemPrompt: Self.followUpSystemPrompt,
+        messages: anthropicMessages()
+      )
+    } catch {
+      statusText = error.localizedDescription
       isSending = false
+      return
     }
+
+    if let onSendChat {
+      let messageID = beginStreamingAssistantMessage(marker: nil)
+      onSendChat(input, messageID)
+      return
+    }
+
+    chatTask?.cancel()
+    chatTask = Task { @MainActor [weak self] in
+      guard let self else { return }
+      do {
+        let response = try await self.anthropicSummary.chat(input)
+        self.messages.append(SummaryChatMessage(role: .assistant, text: response))
+        self.statusText = ""
+      } catch is CancellationError {
+        return
+      } catch {
+        self.statusText = error.localizedDescription
+      }
+      self.isSending = false
+    }
+  }
+
+  func requestSpeakLatest() {
+    guard let latestAssistantText else { return }
+    onSpeakText?(latestAssistantText)
+  }
+
+  func promptTypeChanged() {
+    onPromptTypeChanged?()
+  }
+
+  func beginStreamingAssistantMessage(marker: String?) -> SummaryChatMessage.ID {
+    if let marker {
+      messages.append(SummaryChatMessage(role: .user, text: marker, isHistoryContext: false))
+    }
+    let placeholder = SummaryChatMessage(role: .assistant, text: "")
+    messages.append(placeholder)
+    activeSummaryMessageID = placeholder.id
+    isSending = true
+    return placeholder.id
+  }
+
+  func appendStreamingDelta(to id: SummaryChatMessage.ID, _ delta: String) {
+    guard let index = messages.firstIndex(where: { $0.id == id }) else { return }
+    messages[index].text += delta
+  }
+
+  func finishStreamingMessage(
+    id: SummaryChatMessage.ID,
+    text: String,
+    statusText: String,
+    asSummaryContext: Bool
+  ) {
+    if let index = messages.firstIndex(where: { $0.id == id }) {
+      messages[index].text = text
+    }
+    if asSummaryContext {
+      summaryContext = text
+    }
+    isSending = false
+    self.statusText = statusText
+  }
+
+  func failStreamingMessage(id: SummaryChatMessage.ID, statusText: String) {
+    if let index = messages.firstIndex(where: { $0.id == id }),
+      messages[index].text.isEmpty
+    {
+      messages.remove(at: index)
+    }
+    isSending = false
+    self.statusText = statusText
   }
 
   func copySummaryToPasteboard() {
@@ -237,6 +320,14 @@ final class SummaryWindowPresenter: NSObject, NSWindowDelegate {
 
   private let state = SummaryWindowState()
   private var windowController: NSWindowController?
+
+  var chatState: SummaryWindowState {
+    state
+  }
+
+  func showWindowIfNeeded() {
+    showWindow()
+  }
 
   func show(summary: String, sourceCharacterCount: Int) {
     state.replaceSummary(summary, sourceCharacterCount: sourceCharacterCount)
@@ -355,7 +446,11 @@ struct SummaryWindowView: View {
         Menu {
           ForEach(summaryTypes) { type in
             Button(selectedTitle(type.title, isSelected: selectedSummaryPrompt == type.id)) {
+              let changed = selectedSummaryPrompt != type.id
               selectedSummaryPrompt = type.id
+              if changed {
+                state.promptTypeChanged()
+              }
             }
           }
           Divider()
@@ -436,6 +531,12 @@ struct SummaryWindowView: View {
             .lineLimit(1)
         }
         Spacer()
+        Button {
+          state.requestSpeakLatest()
+        } label: {
+          Label("Read Aloud", systemImage: "speaker.wave.2")
+        }
+        .disabled(state.latestAssistantText == nil || state.isSending)
         Button {
           state.copySummaryToPasteboard()
         } label: {

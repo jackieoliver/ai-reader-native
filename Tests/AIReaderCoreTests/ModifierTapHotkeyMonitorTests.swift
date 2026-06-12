@@ -16,9 +16,9 @@ final class ModifierTapHotkeyMonitorTests: XCTestCase {
       ModifierTapHotkeyMonitor.playbackKeyGesture(keyCode: 2, flags: .maskControl),
       .fastForward
     )
-    XCTAssertEqual(
+    XCTAssertNil(
       ModifierTapHotkeyMonitor.playbackKeyGesture(keyCode: 11, flags: .maskControl),
-      .stop
+      "Ctrl+B stop hotkey was removed; pause replaces stop."
     )
   }
 
@@ -35,7 +35,7 @@ final class ModifierTapHotkeyMonitorTests: XCTestCase {
     XCTAssertEqual(ReaderAction.rewind.shortcutText, "Ctrl+A")
     XCTAssertEqual(ReaderAction.pauseResume.shortcutText, "Ctrl+S")
     XCTAssertEqual(ReaderAction.fastForward.shortcutText, "Ctrl+D")
-    XCTAssertEqual(ReaderAction.stop.shortcutText, "Ctrl+B")
+    XCTAssertNil(ReaderAction.stop.shortcutText)
     XCTAssertNil(ReaderAction.summarize.shortcutText)
     XCTAssertNil(ReaderAction.startFromBeginning.shortcutText)
     XCTAssertNil(ReaderAction.replay.shortcutText)

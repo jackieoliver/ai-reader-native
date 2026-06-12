@@ -160,13 +160,23 @@ public actor CartesiaWebSocketSpeechService {
   private let reuseValidationIntervalNanoseconds: UInt64 = 3_000_000_000
   private let reuseValidationPingTimeout: TimeInterval = 0.5
   private let warmUpPingTimeout: TimeInterval = 1.0
+  private let idleTimeout: TimeInterval
+  private let cancelAcknowledgmentGrace: TimeInterval
+  private var activeContextID: String?
+  private var cancelRequestedForActiveContext = false
+  private var idleCloseTask: Task<Void, Never>?
+  private var cancelWatchdogTask: Task<Void, Never>?
 
   public init(
     session: URLSession = .shared,
-    endpoint: URL = CartesiaWebSocketSpeechService.defaultEndpoint
+    endpoint: URL = CartesiaWebSocketSpeechService.defaultEndpoint,
+    idleTimeout: TimeInterval = 120,
+    cancelAcknowledgmentGrace: TimeInterval = 0.6
   ) {
     self.session = session
     self.endpoint = endpoint
+    self.idleTimeout = idleTimeout
+    self.cancelAcknowledgmentGrace = cancelAcknowledgmentGrace
   }
 
   public func warmUp(configuration: CartesiaConfiguration) async throws {
@@ -174,6 +184,15 @@ public actor CartesiaWebSocketSpeechService {
     try Task.checkCancellation()
     try await sendPing(on: task, timeout: warmUpPingTimeout)
     lastSocketValidationNanoseconds = DispatchTime.now().uptimeNanoseconds
+    scheduleIdleClose()
+  }
+
+  public func close() {
+    idleCloseTask?.cancel()
+    idleCloseTask = nil
+    cancelWatchdogTask?.cancel()
+    cancelWatchdogTask = nil
+    closeWebSocket()
   }
 
   public nonisolated func events(
@@ -266,58 +285,69 @@ public actor CartesiaWebSocketSpeechService {
     _ input: CartesiaStreamingSpeechInput,
     yieldEvent: @escaping @Sendable (CartesiaStreamingSpeechEvent) async -> Void
   ) async throws {
-    let (task, reused) = try await ensureWebSocket(configuration: input.configuration)
     let contextID = UUID().uuidString
+    await beginGeneration(contextID: contextID)
+    defer { endGeneration(contextID: contextID) }
+
+    let (task, reused) = try await ensureWebSocket(configuration: input.configuration)
 
     do {
-      try Task.checkCancellation()
-      await yieldEvent(.connected(reused: reused))
-
-      let payload = try Self.makeGenerationPayload(input, contextID: contextID)
-      guard let payloadString = String(data: payload, encoding: .utf8) else {
-        throw CartesiaWebSocketSpeechError.invalidMessage("Could not encode generation request as UTF-8.")
-      }
-
-      try await task.send(.string(payloadString))
-      await yieldEvent(.requestSent(contextID: contextID))
-
-      while true {
+      try await withTaskCancellationHandler {
         try Task.checkCancellation()
-        let response = try await receiveResponse(from: task)
+        await yieldEvent(.connected(reused: reused))
 
-        if response.type == "error" {
-          throw CartesiaWebSocketSpeechError.providerError(
-            title: response.title ?? "Generation failed",
-            message: response.message ?? response.errorCode ?? "Unknown error",
-            statusCode: response.statusCode
-          )
+        let payload = try Self.makeGenerationPayload(input, contextID: contextID)
+        guard let payloadString = String(data: payload, encoding: .utf8) else {
+          throw CartesiaWebSocketSpeechError.invalidMessage("Could not encode generation request as UTF-8.")
         }
 
-        if response.type == "chunk", let encodedAudio = response.data {
-          guard let audio = Data(base64Encoded: encodedAudio) else {
-            throw CartesiaWebSocketSpeechError.invalidAudioChunk
+        try await task.send(.string(payloadString))
+        await yieldEvent(.requestSent(contextID: contextID))
+
+        while true {
+          try Task.checkCancellation()
+          let response = try await receiveResponse(from: task)
+          guard response.contextID == nil || response.contextID == contextID else {
+            continue
           }
-          await yieldEvent(
-            .audioChunk(
-              CartesiaStreamingAudioChunk(
-                data: audio,
-                stepTimeMS: response.stepTime,
-                contextID: response.contextID
+
+          if response.type == "error" {
+            throw CartesiaWebSocketSpeechError.providerError(
+              title: response.title ?? "Generation failed",
+              message: response.message ?? response.errorCode ?? "Unknown error",
+              statusCode: response.statusCode
+            )
+          }
+
+          if response.type == "chunk", let encodedAudio = response.data {
+            guard let audio = Data(base64Encoded: encodedAudio) else {
+              throw CartesiaWebSocketSpeechError.invalidAudioChunk
+            }
+            await yieldEvent(
+              .audioChunk(
+                CartesiaStreamingAudioChunk(
+                  data: audio,
+                  stepTimeMS: response.stepTime,
+                  contextID: response.contextID
+                )
               )
             )
-          )
-        }
+          }
 
-        if response.done == true || response.type == "done" {
-          await yieldEvent(.done(contextID: response.contextID))
-          return
+          if response.done == true || response.type == "done" {
+            await yieldEvent(.done(contextID: response.contextID))
+            return
+          }
         }
+      } onCancel: {
+        Task { await self.requestCancel(contextID: contextID) }
       }
     } catch {
-      if Task.isCancelled {
-        try? await cancel(contextID: contextID, on: task)
+      if Task.isCancelled || error is CancellationError {
+        await requestCancel(contextID: contextID)
+      } else {
+        closeWebSocket(ifCurrent: task)
       }
-      closeWebSocket()
       throw error
     }
   }
@@ -327,8 +357,11 @@ public actor CartesiaWebSocketSpeechService {
     textSegments: AsyncThrowingStream<String, Error>,
     yieldEvent: @escaping @Sendable (CartesiaStreamingSpeechEvent) async -> Void
   ) async throws {
-    let (task, reused) = try await ensureWebSocket(configuration: input.configuration)
     let contextID = UUID().uuidString
+    await beginGeneration(contextID: contextID)
+    defer { endGeneration(contextID: contextID) }
+
+    let (task, reused) = try await ensureWebSocket(configuration: input.configuration)
 
     let senderTask = Task {
       var sentAnySegment = false
@@ -367,53 +400,64 @@ public actor CartesiaWebSocketSpeechService {
     }
 
     do {
-      try Task.checkCancellation()
-      await yieldEvent(.connected(reused: reused))
-
-      while true {
+      try await withTaskCancellationHandler {
         try Task.checkCancellation()
-        let response = try await receiveResponse(from: task)
+        await yieldEvent(.connected(reused: reused))
 
-        if response.type == "error" {
-          throw CartesiaWebSocketSpeechError.providerError(
-            title: response.title ?? "Generation failed",
-            message: response.message ?? response.errorCode ?? "Unknown error",
-            statusCode: response.statusCode
-          )
-        }
-
-        if response.type == "chunk", let encodedAudio = response.data {
-          guard let audio = Data(base64Encoded: encodedAudio) else {
-            throw CartesiaWebSocketSpeechError.invalidAudioChunk
+        while true {
+          try Task.checkCancellation()
+          let response = try await receiveResponse(from: task)
+          guard response.contextID == nil || response.contextID == contextID else {
+            continue
           }
-          await yieldEvent(
-            .audioChunk(
-              CartesiaStreamingAudioChunk(
-                data: audio,
-                stepTimeMS: response.stepTime,
-                contextID: response.contextID
+
+          if response.type == "error" {
+            throw CartesiaWebSocketSpeechError.providerError(
+              title: response.title ?? "Generation failed",
+              message: response.message ?? response.errorCode ?? "Unknown error",
+              statusCode: response.statusCode
+            )
+          }
+
+          if response.type == "chunk", let encodedAudio = response.data {
+            guard let audio = Data(base64Encoded: encodedAudio) else {
+              throw CartesiaWebSocketSpeechError.invalidAudioChunk
+            }
+            await yieldEvent(
+              .audioChunk(
+                CartesiaStreamingAudioChunk(
+                  data: audio,
+                  stepTimeMS: response.stepTime,
+                  contextID: response.contextID
+                )
               )
             )
-          )
-        }
+          }
 
-        if response.done == true || response.type == "done" {
-          try await senderTask.value
-          await yieldEvent(.done(contextID: response.contextID))
-          return
+          if response.done == true || response.type == "done" {
+            try await senderTask.value
+            await yieldEvent(.done(contextID: response.contextID))
+            return
+          }
         }
+      } onCancel: {
+        Task { await self.requestCancel(contextID: contextID) }
       }
     } catch {
       senderTask.cancel()
-      if Task.isCancelled {
-        try? await cancel(contextID: contextID, on: task)
+      if Task.isCancelled || error is CancellationError {
+        await requestCancel(contextID: contextID)
+      } else {
+        closeWebSocket(ifCurrent: task)
       }
-      closeWebSocket()
       throw error
     }
   }
 
   private func ensureWebSocket(configuration: CartesiaConfiguration) async throws -> (URLSessionWebSocketTask, Bool) {
+    idleCloseTask?.cancel()
+    idleCloseTask = nil
+
     let nextConnectionID = CartesiaWebSocketConnectionID(
       apiKey: configuration.apiKey,
       version: configuration.version
@@ -509,6 +553,84 @@ public actor CartesiaWebSocketSpeechService {
     webSocketTask = nil
     connectionID = nil
     lastSocketValidationNanoseconds = nil
+  }
+
+  private func closeWebSocket(ifCurrent task: URLSessionWebSocketTask) {
+    guard webSocketTask === task else {
+      task.cancel(with: .goingAway, reason: nil)
+      return
+    }
+    closeWebSocket()
+  }
+
+  private func beginGeneration(contextID: String) async {
+    idleCloseTask?.cancel()
+    idleCloseTask = nil
+    cancelWatchdogTask?.cancel()
+    cancelWatchdogTask = nil
+
+    if let staleContextID = activeContextID {
+      if let task = webSocketTask {
+        try? await cancel(contextID: staleContextID, on: task)
+      }
+      closeWebSocket()
+    }
+
+    activeContextID = contextID
+    cancelRequestedForActiveContext = false
+  }
+
+  private func endGeneration(contextID: String) {
+    guard activeContextID == contextID else { return }
+    activeContextID = nil
+    cancelRequestedForActiveContext = false
+    cancelWatchdogTask?.cancel()
+    cancelWatchdogTask = nil
+    scheduleIdleClose()
+  }
+
+  private func requestCancel(contextID: String) async {
+    guard activeContextID == contextID,
+      !cancelRequestedForActiveContext,
+      let task = webSocketTask
+    else {
+      return
+    }
+
+    cancelRequestedForActiveContext = true
+    let grace = cancelAcknowledgmentGrace
+    cancelWatchdogTask?.cancel()
+    cancelWatchdogTask = Task { [weak self] in
+      try? await Task.sleep(for: .seconds(grace))
+      guard !Task.isCancelled else { return }
+      await self?.forceCloseIfStillActive(contextID: contextID)
+    }
+    try? await cancel(contextID: contextID, on: task)
+  }
+
+  private func forceCloseIfStillActive(contextID: String) {
+    cancelWatchdogTask = nil
+    guard activeContextID == contextID else { return }
+    closeWebSocket()
+  }
+
+  private func scheduleIdleClose() {
+    idleCloseTask?.cancel()
+    idleCloseTask = nil
+    guard webSocketTask != nil else { return }
+
+    let timeout = idleTimeout
+    idleCloseTask = Task { [weak self] in
+      try? await Task.sleep(for: .seconds(timeout))
+      guard !Task.isCancelled else { return }
+      await self?.closeIfIdle()
+    }
+  }
+
+  private func closeIfIdle() {
+    idleCloseTask = nil
+    guard activeContextID == nil else { return }
+    closeWebSocket()
   }
 }
 

@@ -180,37 +180,41 @@ public final class AnthropicSummaryService: @unchecked Sendable {
     continuation.yield(.responseStarted)
     var yieldedText = false
 
-    for try await line in bytes.lines {
-      try Task.checkCancellation()
-      guard line.hasPrefix("data: ") else {
-        continue
-      }
+    try await withTaskCancellationHandler {
+      for try await line in bytes.lines {
+        try Task.checkCancellation()
+        guard line.hasPrefix("data: ") else {
+          continue
+        }
 
-      let payload = String(line.dropFirst("data: ".count))
-      if payload == "[DONE]" {
-        break
-      }
+        let payload = String(line.dropFirst("data: ".count))
+        if payload == "[DONE]" {
+          break
+        }
 
-      guard let data = payload.data(using: .utf8) else {
-        continue
-      }
+        guard let data = payload.data(using: .utf8) else {
+          continue
+        }
 
-      let event = try JSONDecoder().decode(AnthropicStreamEnvelope.self, from: data)
-      if event.type == "error" {
-        throw ProviderAPIError.httpError(
-          provider: "Anthropic",
-          statusCode: 0,
-          body: event.error?.message ?? "Streaming error."
-        )
+        let event = try JSONDecoder().decode(AnthropicStreamEnvelope.self, from: data)
+        if event.type == "error" {
+          throw ProviderAPIError.httpError(
+            provider: "Anthropic",
+            statusCode: 0,
+            body: event.error?.message ?? "Streaming error."
+          )
+        }
+        if event.type == "content_block_delta", let text = event.delta?.text, !text.isEmpty {
+          yieldedText = true
+          continuation.yield(.textDelta(text))
+        }
+        if event.type == "message_stop" {
+          continuation.yield(.messageStop)
+          break
+        }
       }
-      if event.type == "content_block_delta", let text = event.delta?.text, !text.isEmpty {
-        yieldedText = true
-        continuation.yield(.textDelta(text))
-      }
-      if event.type == "message_stop" {
-        continuation.yield(.messageStop)
-        break
-      }
+    } onCancel: {
+      bytes.task.cancel()
     }
 
     guard yieldedText else {

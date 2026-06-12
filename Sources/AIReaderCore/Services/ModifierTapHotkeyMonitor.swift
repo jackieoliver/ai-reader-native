@@ -239,8 +239,6 @@ public final class ModifierTapHotkeyMonitor: @unchecked Sendable {
       return .pauseResume
     case 2:
       return .fastForward
-    case 11:
-      return .stop
     default:
       return nil
     }

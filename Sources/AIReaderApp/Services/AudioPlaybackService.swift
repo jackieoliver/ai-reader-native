@@ -34,6 +34,11 @@ final class AudioPlaybackService {
   private var lastPCMSampleRate = 44_100
   private var hasStreamingPlaybackSession = false
   private var streamPlaybackPaused = false
+  private var streamScheduleGeneration = 0
+  private var pendingStreamBufferCount = 0
+  private var streamInputFinished = false
+
+  var onStreamingPlaybackFinished: (() -> Void)?
 
   var hasReplayableAudio: Bool {
     lastAudioData != nil || lastPCMData != nil
@@ -94,11 +99,17 @@ final class AudioPlaybackService {
     currentPCMData = Data()
     hasStreamingPlaybackSession = true
     streamPlaybackPaused = false
+    streamScheduleGeneration += 1
+    pendingStreamBufferCount = 0
+    streamInputFinished = false
     playerNode?.play()
   }
 
   @discardableResult
   func enqueuePCMFloat32(_ data: Data, sampleRate: Int = 44_100) throws -> TimeInterval {
+    guard hasStreamingPlaybackSession else {
+      return currentStreamDuration
+    }
     try ensureStreamingEngine(sampleRate: sampleRate)
 
     let alignedByteCount = data.count - (data.count % MemoryLayout<Float>.size)
@@ -121,7 +132,7 @@ final class AudioPlaybackService {
       destination.copyMemory(from: source)
     }
 
-    playerNode.scheduleBuffer(buffer, completionHandler: nil)
+    scheduleStreamBuffer(buffer, on: playerNode)
     if !streamPlaybackPaused && !playerNode.isPlaying {
       playerNode.play()
     }
@@ -144,6 +155,8 @@ final class AudioPlaybackService {
       hasStreamingPlaybackSession = false
       streamPlaybackPaused = false
     }
+    streamInputFinished = true
+    fireStreamingPlaybackFinishedIfNeeded()
     return currentStreamDuration
   }
 
@@ -193,6 +206,9 @@ final class AudioPlaybackService {
   func stop() {
     currentPlayer?.stop()
     currentPlayer = nil
+    streamScheduleGeneration += 1
+    pendingStreamBufferCount = 0
+    streamInputFinished = false
     playerNode?.stop()
     streamFrameCount = 0
     streamPlaybackStartFrame = 0
@@ -225,6 +241,32 @@ final class AudioPlaybackService {
     }
 
     return seekStreamingPlayback(toFrame: 0, shouldPlay: true)
+  }
+
+  private func scheduleStreamBuffer(_ buffer: AVAudioPCMBuffer, on playerNode: AVAudioPlayerNode) {
+    pendingStreamBufferCount += 1
+    let generation = streamScheduleGeneration
+    playerNode.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
+      Task { @MainActor [weak self] in
+        self?.streamBufferCompleted(generation: generation)
+      }
+    }
+  }
+
+  private func streamBufferCompleted(generation: Int) {
+    guard generation == streamScheduleGeneration else { return }
+    pendingStreamBufferCount = max(pendingStreamBufferCount - 1, 0)
+    fireStreamingPlaybackFinishedIfNeeded()
+  }
+
+  private func fireStreamingPlaybackFinishedIfNeeded() {
+    guard hasStreamingPlaybackSession,
+      streamInputFinished,
+      pendingStreamBufferCount == 0
+    else {
+      return
+    }
+    onStreamingPlaybackFinished?()
   }
 
   private var currentStreamDuration: TimeInterval {
@@ -278,6 +320,8 @@ final class AudioPlaybackService {
 
     let targetFrame = clampedStreamingSeekFrame(requestedFrame, totalFrames: totalFrames)
 
+    streamScheduleGeneration += 1
+    pendingStreamBufferCount = 0
     playerNode.stop()
     streamPlaybackStartFrame = targetFrame
 
@@ -285,7 +329,7 @@ final class AudioPlaybackService {
       return .unavailable
     }
 
-    playerNode.scheduleBuffer(buffer, completionHandler: nil)
+    scheduleStreamBuffer(buffer, on: playerNode)
     if shouldPlay {
       streamPlaybackPaused = false
       playerNode.play()
