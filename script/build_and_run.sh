@@ -10,6 +10,11 @@ BUILD_STAMP="$(date -u '+%Y%m%d%H%M%S')"
 BUILD_TIMESTAMP="${AI_READER_BUILD_TIMESTAMP:-$(date -u '+%Y-%m-%dT%H:%M:%SZ')}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Where the installed app should look for .env and prompts/. Override when
+# building from a temporary checkout (e.g. a worktree or CI export) so the
+# bundle never needs a post-install Info.plist patch + re-sign, which would
+# invalidate the macOS Accessibility grant.
+PROJECT_ROOT_VALUE="${AI_READER_PROJECT_ROOT_OVERRIDE:-$ROOT_DIR}"
 DIST_DIR="$ROOT_DIR/dist"
 INSTALL_DIR="${AI_READER_INSTALL_DIR:-/Applications}"
 INSTALL_TO_APPLICATIONS="${AI_READER_INSTALL_TO_APPLICATIONS:-1}"
@@ -125,7 +130,7 @@ cat >"$INFO_PLIST" <<PLIST
   <key>AIReaderBuildTimestamp</key>
   <string>$(plist_escape "$BUILD_TIMESTAMP")</string>
   <key>AIReaderProjectRoot</key>
-  <string>$(plist_escape "$ROOT_DIR")</string>
+  <string>$(plist_escape "$PROJECT_ROOT_VALUE")</string>
   <key>LSMinimumSystemVersion</key>
   <string>$MIN_SYSTEM_VERSION</string>
   <key>NSPrincipalClass</key>
@@ -164,7 +169,7 @@ open_app() {
 }
 
 run_app_binary() {
-  AI_READER_PROJECT_ROOT="$ROOT_DIR" "$RUN_APP_BUNDLE/Contents/MacOS/$APP_EXECUTABLE_NAME" "$@"
+  AI_READER_PROJECT_ROOT="$PROJECT_ROOT_VALUE" "$RUN_APP_BUNDLE/Contents/MacOS/$APP_EXECUTABLE_NAME" "$@"
 }
 
 sign_app
