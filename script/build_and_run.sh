@@ -37,7 +37,7 @@ case "$APP_VARIANT" in
     DEFAULT_APP_DISPLAY_NAME="AI Reader Dev - $PERMISSION_TEST_ID"
     DEFAULT_APP_EXECUTABLE_NAME="AIReaderDev"
     DEFAULT_BUNDLE_ID="com.hapticasensorics.AIReader.dev.permission.$PERMISSION_TEST_ID"
-    DEFAULT_VERSION="1.2.0-dev"
+    DEFAULT_VERSION="1.3.0-dev"
     DEFAULT_APP_IDENTITY_PLIST_VALUE="dev-permission:$PERMISSION_TEST_ID"
     ;;
   dev|development|debug|local|stable-dev|stable_dev)
@@ -47,7 +47,7 @@ case "$APP_VARIANT" in
     DEFAULT_APP_DISPLAY_NAME="AI Reader Dev"
     DEFAULT_APP_EXECUTABLE_NAME="AIReaderDev"
     DEFAULT_BUNDLE_ID="com.hapticasensorics.AIReader.dev"
-    DEFAULT_VERSION="1.2.0-dev"
+    DEFAULT_VERSION="1.3.0-dev"
     DEFAULT_APP_IDENTITY_PLIST_VALUE="dev"
     ;;
   official|release|prod|production|public)
@@ -57,7 +57,7 @@ case "$APP_VARIANT" in
     DEFAULT_APP_DISPLAY_NAME="AI Reader"
     DEFAULT_APP_EXECUTABLE_NAME="AIReader"
     DEFAULT_BUNDLE_ID="com.hapticasensorics.AIReader"
-    DEFAULT_VERSION="1.2.0"
+    DEFAULT_VERSION="1.3.0"
     DEFAULT_APP_IDENTITY_PLIST_VALUE="official"
     ;;
   *)

@@ -683,18 +683,24 @@ final class ReaderController: ObservableObject {
     }
   }
 
-  /// Captured text persists here until new clipboard text replaces it, so a
-  /// re-trigger never depends on the system clipboard still holding it.
-  /// Empty or unchanged clipboard on a spoken trigger means "hear it again":
-  /// replay the banked audio rather than re-capturing and regenerating.
+  /// Captured text persists here until new selected or fallback clipboard text
+  /// replaces it. Empty or unchanged capture on a spoken trigger means "hear it
+  /// again": replay the banked audio rather than re-capturing and regenerating.
   private func handleCaptureTrigger(_ mode: ReaderPipelineMode, triggeredAt: UInt64) {
     let captureStart = LatencyClock.now
-    let clipboardText = (try? textCapture.capture())?.text
+    var captured: CapturedText?
+    var captureError: Error?
+    do {
+      captured = try textCapture.capture()
+    } catch {
+      captureError = error
+    }
     let captureMS = LatencyClock.milliseconds(from: captureStart, to: LatencyClock.now)
+    noteClipboardFallbackIfNeeded(captured)
 
-    if let clipboardText, clipboardText != lastCapturedText {
-      lastCapturedText = clipboardText
-      startPipeline(mode, sourceText: clipboardText, captureMS: captureMS, triggeredAt: triggeredAt)
+    if let captured, captured.text != lastCapturedText {
+      lastCapturedText = captured.text
+      startPipeline(mode, sourceText: captured.text, captureMS: captureMS, triggeredAt: triggeredAt)
       return
     }
 
@@ -703,13 +709,26 @@ final class ReaderController: ObservableObject {
       return
     }
 
-    if let sourceText = clipboardText ?? lastCapturedText {
+    if let sourceText = captured?.text ?? lastCapturedText {
       startPipeline(mode, sourceText: sourceText, captureMS: captureMS, triggeredAt: triggeredAt)
       return
     }
 
     status = .missingClipboardText
-    message = TextCaptureError.missingClipboardText.localizedDescription
+    message = captureError?.localizedDescription ?? TextCaptureError.missingClipboardText.localizedDescription
+  }
+
+  private func noteClipboardFallbackIfNeeded(_ captured: CapturedText?) {
+    guard captured?.source == .clipboard,
+      let selectionFailure = captured?.directSelectionFailure
+    else {
+      return
+    }
+
+    let fallbackMessage =
+      "Using copied text because selected-text capture failed: \(selectionFailure.localizedDescription)"
+    message = fallbackMessage
+    latencyMessage = fallbackMessage
   }
 
   private func replayLastAudio() {
@@ -928,14 +947,14 @@ final class ReaderController: ObservableObject {
       switch mode {
       case .readClipboard:
         status = .reading
-        message = "Streaming copied text into Cartesia."
+        message = "Streaming captured text into Cartesia."
         let cartesia = try ProviderConfiguration.requireReadConfiguration()
         let remainingDuration = try await streamCartesiaTextBySegments(
           text: sourceText,
           cartesia: cartesia,
           triggeredAt: triggeredAt,
           captureMS: captureMS,
-          playbackMessage: "Reading copied text."
+          playbackMessage: "Reading captured text."
         )
         guard !Task.isCancelled else { return }
         settleBackToReady(from: .reading, after: remainingDuration)
