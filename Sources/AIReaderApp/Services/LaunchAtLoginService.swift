@@ -31,8 +31,8 @@ enum LaunchAtLoginService {
     case .notFound:
       return LaunchAtLoginState(
         isEnabled: false,
-        canChange: false,
-        message: "Install the app bundle before enabling login."
+        canChange: true,
+        message: nil
       )
     @unknown default:
       return LaunchAtLoginState(
@@ -41,6 +41,19 @@ enum LaunchAtLoginService {
         message: "Launch at Login status unavailable."
       )
     }
+  }
+
+  static func diagnosticLines() -> [String] {
+    let state = currentState
+    return [
+      "bundle_url=\(Bundle.main.bundleURL.path)",
+      "bundle_identifier=\(Bundle.main.bundleIdentifier ?? "unknown")",
+      "running_from_app_bundle=\(isRunningFromAppBundle)",
+      "smappservice_status=\(statusName(SMAppService.mainApp.status))",
+      "state_is_enabled=\(state.isEnabled)",
+      "state_can_change=\(state.canChange)",
+      "state_message=\(state.message ?? "")",
+    ]
   }
 
   static func setEnabled(_ isEnabled: Bool) throws {
@@ -64,6 +77,21 @@ enum LaunchAtLoginService {
 
   private static var isRunningFromAppBundle: Bool {
     Bundle.main.bundleURL.pathExtension == "app"
+  }
+
+  private static func statusName(_ status: SMAppService.Status) -> String {
+    switch status {
+    case .enabled:
+      return "enabled"
+    case .notRegistered:
+      return "not_registered"
+    case .requiresApproval:
+      return "requires_approval"
+    case .notFound:
+      return "not_found"
+    @unknown default:
+      return "unknown"
+    }
   }
 }
 

@@ -37,7 +37,7 @@ case "$APP_VARIANT" in
     DEFAULT_APP_DISPLAY_NAME="AI Reader Dev - $PERMISSION_TEST_ID"
     DEFAULT_APP_EXECUTABLE_NAME="AIReaderDev"
     DEFAULT_BUNDLE_ID="com.hapticasensorics.AIReader.dev.permission.$PERMISSION_TEST_ID"
-    DEFAULT_VERSION="1.1.0-dev"
+    DEFAULT_VERSION="1.2.0-dev"
     DEFAULT_APP_IDENTITY_PLIST_VALUE="dev-permission:$PERMISSION_TEST_ID"
     ;;
   dev|development|debug|local|stable-dev|stable_dev)
@@ -47,7 +47,7 @@ case "$APP_VARIANT" in
     DEFAULT_APP_DISPLAY_NAME="AI Reader Dev"
     DEFAULT_APP_EXECUTABLE_NAME="AIReaderDev"
     DEFAULT_BUNDLE_ID="com.hapticasensorics.AIReader.dev"
-    DEFAULT_VERSION="1.1.0-dev"
+    DEFAULT_VERSION="1.2.0-dev"
     DEFAULT_APP_IDENTITY_PLIST_VALUE="dev"
     ;;
   official|release|prod|production|public)
@@ -57,7 +57,7 @@ case "$APP_VARIANT" in
     DEFAULT_APP_DISPLAY_NAME="AI Reader"
     DEFAULT_APP_EXECUTABLE_NAME="AIReader"
     DEFAULT_BUNDLE_ID="com.hapticasensorics.AIReader"
-    DEFAULT_VERSION="1.1.0"
+    DEFAULT_VERSION="1.2.0"
     DEFAULT_APP_IDENTITY_PLIST_VALUE="official"
     ;;
   *)
@@ -143,12 +143,31 @@ PLIST
 
 sign_app() {
   local identity="${AI_READER_CODESIGN_IDENTITY:-${CODESIGN_IDENTITY:-}}"
-  if [[ "$SIGNING_MODE" == "apple-development" && -z "$identity" ]]; then
-    identity="$(security find-identity -v -p codesigning 2>/dev/null | awk -F '"' '/Apple Development/ { print $2; exit }')"
-  fi
+  local timestamp_arg=()
 
-  if [[ "$SIGNING_MODE" == "apple-development" && -n "$identity" ]]; then
-    /usr/bin/codesign --force --deep --options runtime --sign "$identity" "$APP_BUNDLE" >/dev/null
+  case "$SIGNING_MODE" in
+    apple-development)
+      if [[ -z "$identity" ]]; then
+        identity="$(security find-identity -v -p codesigning 2>/dev/null | awk -F '"' '/Apple Development/ { print $2; exit }')"
+      fi
+      ;;
+    developer-id)
+      if [[ -z "$identity" ]]; then
+        identity="$(security find-identity -v -p codesigning 2>/dev/null | awk -F '"' '/Developer ID Application/ { print $2; exit }')"
+      fi
+      timestamp_arg=(--timestamp)
+      ;;
+    ad-hoc|adhoc)
+      identity="-"
+      ;;
+    *)
+      echo "error: AI_READER_SIGNING_MODE must be 'apple-development', 'developer-id', or 'ad-hoc'." >&2
+      exit 2
+      ;;
+  esac
+
+  if [[ -n "$identity" ]]; then
+    /usr/bin/codesign --force --deep --options runtime "${timestamp_arg[@]}" --sign "$identity" "$APP_BUNDLE" >/dev/null
     /usr/bin/codesign --verify --strict --deep "$APP_BUNDLE" >/dev/null
     return
   fi
@@ -159,7 +178,7 @@ sign_app() {
     exit 2
   fi
 
-  echo "warning: no Apple Development codesigning identity found; using ad-hoc signing, so macOS permission grants may not survive rebuilds." >&2
+  echo "warning: no requested codesigning identity found; using ad-hoc signing, so macOS permission grants may not survive rebuilds." >&2
   /usr/bin/codesign --force --deep --options runtime --sign - "$APP_BUNDLE" >/dev/null
   /usr/bin/codesign --verify --strict --deep "$APP_BUNDLE" >/dev/null
 }
@@ -213,8 +232,17 @@ case "$MODE" in
   --playback-seek-probe|playback-seek-probe)
     run_app_binary --playback-seek-probe
     ;;
+  --launch-at-login-probe|launch-at-login-probe)
+    run_app_binary --launch-at-login-probe
+    ;;
+  --launch-at-login-register-probe|launch-at-login-register-probe)
+    run_app_binary --launch-at-login-register-probe
+    ;;
+  --launch-at-login-unregister-probe|launch-at-login-unregister-probe)
+    run_app_binary --launch-at-login-unregister-probe
+    ;;
   *)
-    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify|--shortcut-probe|--clipboard-probe|--tts-probe|--playback-seek-probe]" >&2
+    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify|--shortcut-probe|--clipboard-probe|--tts-probe|--playback-seek-probe|--launch-at-login-probe|--launch-at-login-register-probe|--launch-at-login-unregister-probe]" >&2
     echo "       AI_READER_APP_IDENTITY=permission-test|stable-dev|official $0" >&2
     exit 2
     ;;

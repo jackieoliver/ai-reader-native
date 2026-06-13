@@ -40,6 +40,12 @@ struct AIReaderApp: App {
     if CommandLine.arguments.contains("--tts-probe") {
       Self.runTTSProbe()
     }
+
+    if CommandLine.arguments.contains("--launch-at-login-probe")
+      || CommandLine.arguments.contains("--launch-at-login-register-probe")
+      || CommandLine.arguments.contains("--launch-at-login-unregister-probe") {
+      Self.runLaunchAtLoginProbe()
+    }
   }
 
   var body: some Scene {
@@ -120,6 +126,32 @@ struct AIReaderApp: App {
     print("shortcut_probe_timeout=1 saw_double_control=\(sawDoubleControl) saw_control_option=\(sawControlOption) saw_control_a=\(sawControlA) saw_control_s=\(sawControlS) saw_control_d=\(sawControlD) saw_control_b=\(sawControlB)")
     fflush(stdout)
     exit(EXIT_FAILURE)
+  }
+
+  private static func runLaunchAtLoginProbe() -> Never {
+    LaunchAtLoginService.diagnosticLines().forEach { print($0) }
+    if CommandLine.arguments.contains("--launch-at-login-register-probe") {
+      do {
+        try LaunchAtLoginService.setEnabled(true)
+        print("register_result=ok")
+      } catch {
+        print("register_result=error")
+        print("register_error=\(error.localizedDescription)")
+      }
+      LaunchAtLoginService.diagnosticLines().forEach { print("after_register_\($0)") }
+    }
+    if CommandLine.arguments.contains("--launch-at-login-unregister-probe") {
+      do {
+        try LaunchAtLoginService.setEnabled(false)
+        print("unregister_result=ok")
+      } catch {
+        print("unregister_result=error")
+        print("unregister_error=\(error.localizedDescription)")
+      }
+      LaunchAtLoginService.diagnosticLines().forEach { print("after_unregister_\($0)") }
+    }
+    fflush(stdout)
+    exit(EXIT_SUCCESS)
   }
 
   private static func runClipboardProbe() -> Never {
