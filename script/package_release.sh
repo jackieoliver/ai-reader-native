@@ -156,7 +156,6 @@ rm -f "$DMG_PATH"
 
 /usr/bin/codesign --force --timestamp --sign "$SIGN_IDENTITY" "$DMG_PATH" >/dev/null
 /usr/bin/codesign --verify --verbose=2 "$DMG_PATH" >"$DMG_CODESIGN_LOG" 2>&1
-/usr/bin/shasum -a 256 "$DMG_PATH" | tee "$DMG_PATH.sha256"
 
 if [[ -n "${AI_READER_NOTARY_PROFILE:-}" ]]; then
   xcrun notarytool submit "$DMG_PATH" \
@@ -190,6 +189,8 @@ else
   fi
   echo "warning: Gatekeeper assessment did not accept the DMG. This candidate is not approved for public release." >&2
 fi
+
+/usr/bin/shasum -a 256 "$DMG_PATH" | tee "$DMG_PATH.sha256"
 
 if [[ "$PUBLIC_RELEASE" == "1" ]]; then
   echo "public_release_ready=1"
