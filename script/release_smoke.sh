@@ -9,8 +9,11 @@ EXPECTED_SIGNING_PREFIX="${AI_READER_EXPECTED_SIGNING_PREFIX:-Developer ID Appli
 
 APP_BUNDLE="${AI_READER_APP_BUNDLE:-$DIST_DIR/$APP_NAME.app}"
 DMG_PATH="${AI_READER_DMG_PATH:-}"
+INSTALLED_APP_BUNDLE="${AI_READER_INSTALLED_APP_BUNDLE:-/Applications/$APP_NAME.app}"
 EXPECTED_VERSION="${AI_READER_RELEASE_VERSION:-}"
 ALLOW_UNNOTARIZED="${AI_READER_ALLOW_UNNOTARIZED:-0}"
+REQUIRE_ACCESSIBILITY="${AI_READER_REQUIRE_ACCESSIBILITY:-0}"
+CHECK_INSTALLED_APP=0
 
 failures=0
 public_release_blockers=0
@@ -21,7 +24,7 @@ tmp_files=()
 
 usage() {
   cat <<USAGE
-usage: $0 [--app PATH] [--dmg PATH] [--version VERSION] [--allow-unnotarized]
+usage: $0 [--app PATH] [--dmg PATH] [--version VERSION] [--installed-app] [--require-accessibility] [--allow-unnotarized]
 
 Verifies the release app and DMG without installing over /Applications.
 
@@ -30,6 +33,8 @@ Environment:
   AI_READER_RELEASE_TAG           Expected DMG tag, e.g. v1.3.
   AI_READER_APP_BUNDLE            App bundle path. Defaults to dist/AI Reader.app.
   AI_READER_DMG_PATH              DMG path. Defaults to the release tag or newest dist/AIReader-v*.dmg.
+  AI_READER_INSTALLED_APP_BUNDLE  Installed app path for --installed-app. Defaults to /Applications/AI Reader.app.
+  AI_READER_REQUIRE_ACCESSIBILITY Require the permission probe to have Accessibility trust and a ready hotkey tap.
   AI_READER_ALLOW_UNNOTARIZED=1   Let local smoke pass while still reporting the public-release blocker.
 USAGE
 }
@@ -48,6 +53,15 @@ while [[ $# -gt 0 ]]; do
       EXPECTED_VERSION="${2:?missing value for --version}"
       shift 2
       ;;
+    --installed-app)
+      APP_BUNDLE="$INSTALLED_APP_BUNDLE"
+      CHECK_INSTALLED_APP=1
+      shift
+      ;;
+    --require-accessibility)
+      REQUIRE_ACCESSIBILITY=1
+      shift
+      ;;
     --allow-unnotarized)
       ALLOW_UNNOTARIZED=1
       shift
@@ -63,6 +77,18 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+require_bool() {
+  local name="$1"
+  local value="$2"
+  case "$value" in
+    0|1) ;;
+    *)
+      echo "error: $name must be 0 or 1." >&2
+      exit 2
+      ;;
+  esac
+}
 
 cleanup() {
   detach_dmg quiet
@@ -177,6 +203,76 @@ contains() {
   grep -Fq "$needle" "$file"
 }
 
+current_designated_requirement() {
+  /usr/bin/codesign -dr - "$APP_BUNDLE" 2>&1 | sed -n 's/^designated => //p'
+}
+
+tcc_requirement_for_service() {
+  local service="$1"
+  local db="/Library/Application Support/com.apple.TCC/TCC.db"
+  local hex
+
+  [[ -r "$db" ]] || return 2
+  hex="$(/usr/bin/sqlite3 "$db" "select hex(csreq) from access where service='$service' and client='$EXPECTED_BUNDLE_ID' and auth_value=2 order by last_modified desc limit 1;" 2>/dev/null || true)"
+  [[ -n "$hex" ]] || return 1
+  printf '%s' "$hex" | /usr/bin/xxd -r -p | /usr/bin/csreq -r- -t 2>/dev/null
+}
+
+audit_tcc_service() {
+  local service="$1"
+  local expected_requirement="$2"
+  local requirement
+
+  if requirement="$(tcc_requirement_for_service "$service")"; then
+    if [[ "$requirement" == "$expected_requirement" ]]; then
+      pass "tcc_${service#kTCCService}_requirement_matches_current_signature"
+    else
+      fail "stale TCC grant for $service; run script/repair_accessibility.sh. current='$expected_requirement' tcc='$requirement'"
+    fi
+    return
+  fi
+
+  case "$?" in
+    1)
+      fail "missing approved TCC grant for $service and $EXPECTED_BUNDLE_ID"
+      ;;
+    2)
+      fail "could not read /Library/Application Support/com.apple.TCC/TCC.db to audit $service"
+      ;;
+    *)
+      fail "could not decode TCC grant for $service"
+      ;;
+  esac
+}
+
+audit_tcc_if_required() {
+  local expected_requirement
+
+  if [[ "$REQUIRE_ACCESSIBILITY" != "1" ]]; then
+    return 0
+  fi
+
+  expected_requirement="$(current_designated_requirement)"
+  if [[ -z "$expected_requirement" ]]; then
+    fail "could not determine current app designated requirement for TCC audit"
+    return
+  fi
+
+  audit_tcc_service "kTCCServiceAccessibility" "$expected_requirement"
+  audit_tcc_service "kTCCServiceListenEvent" "$expected_requirement"
+}
+
+wait_for_probe_file() {
+  local file="$1"
+  for _ in {1..80}; do
+    if [[ -f "$file" ]]; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
 if [[ -z "$DMG_PATH" ]]; then
   if [[ -n "${AI_READER_RELEASE_TAG:-}" ]]; then
     DMG_PATH="$DIST_DIR/AIReader-$AI_READER_RELEASE_TAG.dmg"
@@ -191,6 +287,8 @@ if [[ -z "$DMG_PATH" ]]; then
   echo "error: no release DMG found. Run script/package_release.sh first or pass --dmg." >&2
   exit 2
 fi
+
+require_bool "AI_READER_REQUIRE_ACCESSIBILITY" "$REQUIRE_ACCESSIBILITY"
 
 if [[ ! -d "$APP_BUNDLE" ]]; then
   echo "error: app bundle not found: $APP_BUNDLE" >&2
@@ -209,8 +307,19 @@ INFO_PLIST="$APP_BUNDLE/Contents/Info.plist"
 note "app=$APP_BUNDLE"
 note "dmg=$DMG_PATH"
 
-if [[ "$(basename "$APP_BUNDLE")" == "AI Reader Dev.app" ]]; then
-  fail "refusing to smoke the local dogfood app; pass the release app bundle instead"
+case "$(basename "$APP_BUNDLE")" in
+  AI\ Reader\ Dev.app|AI\ Reader\ Dev\ -*.app)
+    fail "refusing to smoke the local dogfood app; pass the release app bundle instead"
+    ;;
+esac
+
+if [[ "$CHECK_INSTALLED_APP" == "1" ]]; then
+  expected_installed_app_bundle="$(absolute_path "$INSTALLED_APP_BUNDLE")"
+  if [[ "$APP_BUNDLE" == "$expected_installed_app_bundle" ]]; then
+    pass "installed_app_bundle=$APP_BUNDLE"
+  else
+    fail "--installed-app expected $expected_installed_app_bundle, got $APP_BUNDLE"
+  fi
 fi
 
 if [[ ! -f "$INFO_PLIST" ]]; then
@@ -218,6 +327,7 @@ if [[ ! -f "$INFO_PLIST" ]]; then
 fi
 
 app_version="$(plist_value "$INFO_PLIST" CFBundleShortVersionString)"
+build_version="$(plist_value "$INFO_PLIST" CFBundleVersion)"
 bundle_id="$(plist_value "$INFO_PLIST" CFBundleIdentifier)"
 executable_name="$(plist_value "$INFO_PLIST" CFBundleExecutable)"
 app_identity="$(plist_value "$INFO_PLIST" AIReaderAppIdentity)"
@@ -228,6 +338,12 @@ elif [[ -n "$EXPECTED_VERSION" && "$app_version" != "$EXPECTED_VERSION" ]]; then
   fail "version mismatch: expected $EXPECTED_VERSION, got $app_version"
 else
   pass "version=$app_version"
+fi
+
+if [[ -z "$build_version" ]]; then
+  fail "CFBundleVersion is missing"
+else
+  pass "build_version=$build_version"
 fi
 
 if [[ "$bundle_id" == "$EXPECTED_BUNDLE_ID" ]]; then
@@ -304,11 +420,17 @@ if [[ -n "$mount_point" && -d "$mount_point" ]]; then
     pass "dmg contains $APP_NAME.app"
     dmg_info_plist="$dmg_app/Contents/Info.plist"
     dmg_app_version="$(plist_value "$dmg_info_plist" CFBundleShortVersionString)"
+    dmg_build_version="$(plist_value "$dmg_info_plist" CFBundleVersion)"
     dmg_bundle_id="$(plist_value "$dmg_info_plist" CFBundleIdentifier)"
     if [[ "$dmg_app_version" == "$app_version" ]]; then
       pass "dmg_app_version=$dmg_app_version"
     else
       fail "DMG app version mismatch: dist app is ${app_version:-missing}, DMG app is ${dmg_app_version:-missing}"
+    fi
+    if [[ "$dmg_build_version" == "$build_version" ]]; then
+      pass "dmg_build_version=$dmg_build_version"
+    else
+      fail "DMG app build version mismatch: app is ${build_version:-missing}, DMG app is ${dmg_build_version:-missing}"
     fi
     if [[ "$dmg_bundle_id" == "$bundle_id" ]]; then
       pass "dmg_app_bundle_id=$dmg_bundle_id"
@@ -337,9 +459,10 @@ probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/ai-reader-permission-probe.XXXXXX")"
 permission_probe_file="$probe_dir/permission-probe.txt"
 permission_probe_log="$(make_tmp_file)"
 if [[ -n "${executable_name:-}" && -x "$APP_BUNDLE/Contents/MacOS/$executable_name" ]]; then
-  "$APP_BUNDLE/Contents/MacOS/$executable_name" --permission-probe-file "$permission_probe_file" >"$permission_probe_log" 2>&1 || {
-    fail "permission probe failed: $(tr '\n' ' ' <"$permission_probe_log")"
-  }
+  /usr/bin/open -n "$APP_BUNDLE" --args --permission-probe-file "$permission_probe_file" >"$permission_probe_log" 2>&1 || true
+  if ! wait_for_probe_file "$permission_probe_file"; then
+    fail "permission probe did not write $permission_probe_file: $(tr '\n' ' ' <"$permission_probe_log")"
+  fi
 else
   fail "permission probe executable is missing"
 fi
@@ -349,14 +472,28 @@ if [[ -f "$permission_probe_file" ]]; then
   probe_bundle_id="$(kv_value bundle_identifier "$permission_probe_file")"
   accessibility_trusted="$(kv_value accessibility_trusted "$permission_probe_file")"
   hotkey_ready="$(kv_value hotkey_start_ready "$permission_probe_file")"
+  hotkey_tap_active="$(kv_value hotkey_tap_active "$permission_probe_file")"
+  hotkey_start_error="$(kv_value hotkey_start_error "$permission_probe_file")"
   if [[ "$probe_bundle_id" == "$EXPECTED_BUNDLE_ID" && "$probe_bundle_url" == "$APP_BUNDLE" ]]; then
-    pass "permission_probe_ran bundle_id=$probe_bundle_id accessibility_trusted=${accessibility_trusted:-unknown} hotkey_start_ready=${hotkey_ready:-unknown}"
+    pass "permission_probe_identity bundle_id=$probe_bundle_id bundle_url=$probe_bundle_url"
   else
     fail "permission probe used unexpected app identity: bundle_url=${probe_bundle_url:-missing} bundle_id=${probe_bundle_id:-missing}"
+  fi
+  if [[ "$accessibility_trusted" == "true" && "$hotkey_ready" == "true" && ("$hotkey_tap_active" == "true" || -z "$hotkey_tap_active") ]]; then
+    pass "accessibility_permission_ready=1 hotkey_start_ready=true hotkey_tap_active=${hotkey_tap_active:-not_reported}"
+  else
+    permission_message="Accessibility permission is not ready for $APP_BUNDLE: accessibility_trusted=${accessibility_trusted:-unknown} hotkey_start_ready=${hotkey_ready:-unknown} hotkey_tap_active=${hotkey_tap_active:-unknown} hotkey_start_error=${hotkey_start_error:-}. Run script/repair_accessibility.sh, grant the installed official app, then rerun with --installed-app --require-accessibility."
+    if [[ "$REQUIRE_ACCESSIBILITY" == "1" ]]; then
+      fail "$permission_message"
+    else
+      note "$permission_message"
+    fi
   fi
 else
   fail "permission probe did not write $permission_probe_file"
 fi
+
+audit_tcc_if_required
 
 if [[ -d "$dogfood_app" ]]; then
   dogfood_after="$(/usr/bin/stat -f '%m:%z' "$dogfood_app" 2>/dev/null || true)"

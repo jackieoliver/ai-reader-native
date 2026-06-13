@@ -10,16 +10,10 @@ public enum TextInputSource: String, Equatable, Sendable {
 public struct CapturedText: Equatable, Sendable {
   public var text: String
   public var source: TextInputSource
-  public var directSelectionFailure: TextSelectionCaptureFailure?
 
-  public init(
-    text: String,
-    source: TextInputSource,
-    directSelectionFailure: TextSelectionCaptureFailure? = nil
-  ) {
+  public init(text: String, source: TextInputSource) {
     self.text = text
     self.source = source
-    self.directSelectionFailure = directSelectionFailure
   }
 }
 
@@ -48,15 +42,11 @@ public enum TextSelectionCaptureFailure: LocalizedError, Equatable, Sendable {
 
 public enum TextCaptureError: LocalizedError, Equatable, Sendable {
   case missingClipboardText
-  case missingCapturedText(selectionFailure: TextSelectionCaptureFailure)
 
   public var errorDescription: String? {
     switch self {
     case .missingClipboardText:
-      return "Select text before triggering AI Reader, or copy text for fallback."
-    case .missingCapturedText(let selectionFailure):
-      return "Select text before triggering AI Reader. Direct selection failed: \(selectionFailure.localizedDescription) "
-        + "Clipboard fallback was empty."
+      return "Copy text before triggering AI Reader."
     }
   }
 }
@@ -118,41 +108,20 @@ public struct PasteboardClipboardTextProvider: ClipboardTextProviding {
 }
 
 public final class ClipboardTextCaptureService {
-  private let selectedTextProvider: SelectedTextProviding
   private let clipboardProvider: ClipboardTextProviding
 
   public init(
-    selectedTextProvider: SelectedTextProviding = AccessibilitySelectedTextProvider(),
     clipboardProvider: ClipboardTextProviding = PasteboardClipboardTextProvider()
   ) {
-    self.selectedTextProvider = selectedTextProvider
     self.clipboardProvider = clipboardProvider
   }
 
   public func capture() throws -> CapturedText {
-    do {
-      let selectedText = try selectedTextProvider.selectedText()
-      if let normalizedSelectedText = selectedText.normalizedCapturedText {
-        return CapturedText(text: normalizedSelectedText, source: .accessibilitySelection)
-      }
-      return try captureClipboardFallback(after: .selectedTextEmpty)
-    } catch let selectionFailure as TextSelectionCaptureFailure {
-      return try captureClipboardFallback(after: selectionFailure)
-    } catch {
-      return try captureClipboardFallback(after: .selectedTextUnavailable(error.localizedDescription))
-    }
-  }
-
-  private func captureClipboardFallback(after selectionFailure: TextSelectionCaptureFailure) throws -> CapturedText {
     if let clipboardText = clipboardProvider.string().normalizedCapturedText {
-      return CapturedText(
-        text: clipboardText,
-        source: .clipboard,
-        directSelectionFailure: selectionFailure
-      )
+      return CapturedText(text: clipboardText, source: .clipboard)
     }
 
-    throw TextCaptureError.missingCapturedText(selectionFailure: selectionFailure)
+    throw TextCaptureError.missingClipboardText
   }
 }
 

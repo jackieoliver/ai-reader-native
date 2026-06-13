@@ -13,6 +13,10 @@ struct AIReaderApp: App {
       Self.runPermissionProbe(outputURL: outputURL)
     }
 
+    if let outputURL = Self.textCaptureProbeOutputURL(from: CommandLine.arguments) {
+      Self.runTextCaptureProbe(outputURL: outputURL)
+    }
+
     if CommandLine.arguments.contains("--request-accessibility") {
       NSApplication.shared.setActivationPolicy(.regular)
       NSApplication.shared.activate(ignoringOtherApps: true)
@@ -31,6 +35,11 @@ struct AIReaderApp: App {
 
     if CommandLine.arguments.contains("--clipboard-probe") {
       Self.runClipboardProbe()
+    }
+
+    if CommandLine.arguments.contains("--direct-selection-probe")
+      || CommandLine.arguments.contains("--selected-text-probe") {
+      Self.runDirectSelectionProbe()
     }
 
     if let sourceText = Self.claudeSummaryProbeText(from: CommandLine.arguments) {
@@ -67,7 +76,15 @@ struct AIReaderApp: App {
   }
 
   private static func permissionProbeOutputURL(from arguments: [String]) -> URL? {
-    guard let flagIndex = arguments.firstIndex(of: "--permission-probe-file") else {
+    outputURL(from: arguments, flag: "--permission-probe-file")
+  }
+
+  private static func textCaptureProbeOutputURL(from arguments: [String]) -> URL? {
+    outputURL(from: arguments, flag: "--text-capture-probe-file")
+  }
+
+  private static func outputURL(from arguments: [String], flag: String) -> URL? {
+    guard let flagIndex = arguments.firstIndex(of: flag) else {
       return nil
     }
     let pathIndex = arguments.index(after: flagIndex)
@@ -81,7 +98,8 @@ struct AIReaderApp: App {
     let snapshot = PermissionService.snapshot()
     let monitor = ModifierTapHotkeyMonitor()
     let hotkeyStarted = monitor.start()
-    let hotkeyError = monitor.status.lastError ?? ""
+    let hotkeyStatus = monitor.status
+    let hotkeyError = hotkeyStatus.lastError ?? ""
     if hotkeyStarted {
       monitor.stop()
     }
@@ -91,21 +109,70 @@ struct AIReaderApp: App {
       "bundle_identifier=\(Bundle.main.bundleIdentifier ?? "unknown")",
       "accessibility_trusted=\(snapshot.accessibilityTrusted)",
       "hotkey_start_ready=\(hotkeyStarted)",
+      "hotkey_is_running=\(hotkeyStatus.isRunning)",
+      "hotkey_tap_active=\(hotkeyStatus.tapActive)",
+      "hotkey_observed_flags_changed_count=\(hotkeyStatus.observedFlagsChangedCount)",
+      "hotkey_disabled_count=\(hotkeyStatus.disabledCount)",
+      "hotkey_reenable_attempt_count=\(hotkeyStatus.reenableAttemptCount)",
+      "hotkey_reenable_success_count=\(hotkeyStatus.reenableSuccessCount)",
+      "hotkey_last_disabled_reason=\(hotkeyStatus.lastDisabledReason ?? "")",
       "hotkey_start_error=\(hotkeyError)",
     ]
     let body = lines.joined(separator: "\n") + "\n"
     do {
-      try FileManager.default.createDirectory(
-        at: outputURL.deletingLastPathComponent(),
-        withIntermediateDirectories: true
-      )
-      try body.write(to: outputURL, atomically: true, encoding: .utf8)
+      try writeProbeBody(body, to: outputURL)
       exit(EXIT_SUCCESS)
     } catch {
       print("permission_probe_write_failed=\(error.localizedDescription)")
       fflush(stdout)
       exit(EXIT_FAILURE)
     }
+  }
+
+  private static func runTextCaptureProbe(outputURL: URL) -> Never {
+    var lines = [
+      "bundle_url=\(probeValue(Bundle.main.bundleURL.path))",
+      "bundle_identifier=\(probeValue(Bundle.main.bundleIdentifier ?? "unknown"))",
+      "accessibility_trusted=\(PermissionService.snapshot().accessibilityTrusted)",
+    ]
+    let exitCode: Int32
+
+    do {
+      let captured = try ClipboardTextCaptureService().capture()
+      lines.append("text_capture_probe_passed=1")
+      lines.append("source=\(captured.source.rawValue)")
+      lines.append("length=\(captured.text.count)")
+      exitCode = EXIT_SUCCESS
+    } catch {
+      lines.append("text_capture_probe_passed=0")
+      lines.append("error=\(probeValue(error.localizedDescription))")
+      exitCode = EXIT_FAILURE
+    }
+
+    do {
+      try writeProbeBody(lines.joined(separator: "\n") + "\n", to: outputURL)
+      exit(exitCode)
+    } catch {
+      print("text_capture_probe_write_failed=\(error.localizedDescription)")
+      fflush(stdout)
+      exit(EXIT_FAILURE)
+    }
+  }
+
+  private static func writeProbeBody(_ body: String, to outputURL: URL) throws {
+    try FileManager.default.createDirectory(
+      at: outputURL.deletingLastPathComponent(),
+      withIntermediateDirectories: true
+    )
+    try body.write(to: outputURL, atomically: true, encoding: .utf8)
+  }
+
+  private static func probeValue(_ value: String) -> String {
+    value
+      .replacingOccurrences(of: "\\", with: "\\\\")
+      .replacingOccurrences(of: "\"", with: "'")
+      .replacingOccurrences(of: "\n", with: "\\n")
+      .replacingOccurrences(of: "\r", with: "\\r")
   }
 
   private static func runShortcutProbe() -> Never {
@@ -115,16 +182,6 @@ struct AIReaderApp: App {
     var sawControlA = false
     var sawControlS = false
     var sawControlD = false
-    var sawControlB = false
-
-    print("shortcut_probe_ready=1")
-    print("press=double_control action=read")
-    print("press=control_option action=summarize_and_read")
-    print("press=control_a action=rewind")
-    print("press=control_s action=pause_resume")
-    print("press=control_d action=fast_forward")
-    print("press=control_b action=stop")
-    fflush(stdout)
 
     monitor.playbackKeyGesturesEnabled = true
     monitor.onGesture = { gesture in
@@ -145,8 +202,7 @@ struct AIReaderApp: App {
         sawControlD = true
         print("gesture=control_d action=fast_forward")
       case .stop:
-        sawControlB = true
-        print("gesture=control_b action=stop")
+        print("gesture=control_b action=stop unexpected=1")
       case .startFromBeginning:
         break
       }
@@ -160,9 +216,17 @@ struct AIReaderApp: App {
       exit(EXIT_FAILURE)
     }
 
+    print("shortcut_probe_ready=1")
+    print("press=double_control action=read")
+    print("press=control_option action=summarize_and_read")
+    print("press=control_a action=rewind")
+    print("press=control_s action=pause_resume")
+    print("press=control_d action=fast_forward")
+    fflush(stdout)
+
     let deadline = Date().addingTimeInterval(120)
     while Date() < deadline {
-      if sawDoubleControl && sawControlOption && sawControlA && sawControlS && sawControlD && sawControlB {
+      if sawDoubleControl && sawControlOption && sawControlA && sawControlS && sawControlD {
         monitor.stop()
         print("shortcut_probe_passed=1")
         fflush(stdout)
@@ -173,7 +237,7 @@ struct AIReaderApp: App {
     }
 
     monitor.stop()
-    print("shortcut_probe_timeout=1 saw_double_control=\(sawDoubleControl) saw_control_option=\(sawControlOption) saw_control_a=\(sawControlA) saw_control_s=\(sawControlS) saw_control_d=\(sawControlD) saw_control_b=\(sawControlB)")
+    print("shortcut_probe_timeout=1 saw_double_control=\(sawDoubleControl) saw_control_option=\(sawControlOption) saw_control_a=\(sawControlA) saw_control_s=\(sawControlS) saw_control_d=\(sawControlD)")
     fflush(stdout)
     exit(EXIT_FAILURE)
   }
@@ -214,7 +278,27 @@ struct AIReaderApp: App {
       fflush(stdout)
       exit(EXIT_SUCCESS)
     } catch {
-      print("clipboard_probe_failed=1 error=\"\(error.localizedDescription)\"")
+      print("clipboard_probe_failed=1 error=\"\(probeValue(error.localizedDescription))\"")
+      fflush(stdout)
+      exit(EXIT_FAILURE)
+    }
+  }
+
+  private static func runDirectSelectionProbe() -> Never {
+    print("direct_selection_probe_ready=1")
+    fflush(stdout)
+
+    do {
+      let selectedText = try AccessibilitySelectedTextProvider().selectedText()
+      let normalizedText = selectedText.trimmingCharacters(in: .whitespacesAndNewlines)
+      guard !normalizedText.isEmpty else {
+        throw TextSelectionCaptureFailure.selectedTextEmpty
+      }
+      print("direct_selection_probe_passed=1 source=\(TextInputSource.accessibilitySelection.rawValue) length=\(normalizedText.count)")
+      fflush(stdout)
+      exit(EXIT_SUCCESS)
+    } catch {
+      print("direct_selection_probe_failed=1 error=\"\(probeValue(error.localizedDescription))\"")
       fflush(stdout)
       exit(EXIT_FAILURE)
     }

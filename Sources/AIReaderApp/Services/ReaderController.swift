@@ -683,9 +683,9 @@ final class ReaderController: ObservableObject {
     }
   }
 
-  /// Captured text persists here until new selected or fallback clipboard text
-  /// replaces it. Empty or unchanged capture on a spoken trigger means "hear it
-  /// again": replay the banked audio rather than re-capturing and regenerating.
+  /// Captured clipboard text persists here until new copied text replaces it.
+  /// Empty or unchanged capture on a spoken trigger means "hear it again":
+  /// replay the banked audio rather than re-capturing and regenerating.
   private func handleCaptureTrigger(_ mode: ReaderPipelineMode, triggeredAt: UInt64) {
     let captureStart = LatencyClock.now
     var captured: CapturedText?
@@ -696,7 +696,6 @@ final class ReaderController: ObservableObject {
       captureError = error
     }
     let captureMS = LatencyClock.milliseconds(from: captureStart, to: LatencyClock.now)
-    noteClipboardFallbackIfNeeded(captured)
 
     if let captured, captured.text != lastCapturedText {
       lastCapturedText = captured.text
@@ -716,19 +715,6 @@ final class ReaderController: ObservableObject {
 
     status = .missingClipboardText
     message = captureError?.localizedDescription ?? TextCaptureError.missingClipboardText.localizedDescription
-  }
-
-  private func noteClipboardFallbackIfNeeded(_ captured: CapturedText?) {
-    guard captured?.source == .clipboard,
-      let selectionFailure = captured?.directSelectionFailure
-    else {
-      return
-    }
-
-    let fallbackMessage =
-      "Using copied text because selected-text capture failed: \(selectionFailure.localizedDescription)"
-    message = fallbackMessage
-    latencyMessage = fallbackMessage
   }
 
   private func replayLastAudio() {

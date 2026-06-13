@@ -37,7 +37,7 @@ case "$APP_VARIANT" in
     DEFAULT_APP_DISPLAY_NAME="AI Reader Dev - $PERMISSION_TEST_ID"
     DEFAULT_APP_EXECUTABLE_NAME="AIReaderDev"
     DEFAULT_BUNDLE_ID="com.hapticasensorics.AIReader.dev.permission.$PERMISSION_TEST_ID"
-    DEFAULT_VERSION="1.3.0-dev"
+    DEFAULT_VERSION="1.4.0-dev"
     DEFAULT_APP_IDENTITY_PLIST_VALUE="dev-permission:$PERMISSION_TEST_ID"
     ;;
   dev|development|debug|local|stable-dev|stable_dev)
@@ -47,7 +47,7 @@ case "$APP_VARIANT" in
     DEFAULT_APP_DISPLAY_NAME="AI Reader Dev"
     DEFAULT_APP_EXECUTABLE_NAME="AIReaderDev"
     DEFAULT_BUNDLE_ID="com.hapticasensorics.AIReader.dev"
-    DEFAULT_VERSION="1.3.0-dev"
+    DEFAULT_VERSION="1.4.0-dev"
     DEFAULT_APP_IDENTITY_PLIST_VALUE="dev"
     ;;
   official|release|prod|production|public)
@@ -57,7 +57,7 @@ case "$APP_VARIANT" in
     DEFAULT_APP_DISPLAY_NAME="AI Reader"
     DEFAULT_APP_EXECUTABLE_NAME="AIReader"
     DEFAULT_BUNDLE_ID="com.hapticasensorics.AIReader"
-    DEFAULT_VERSION="1.3.0"
+    DEFAULT_VERSION="1.4.0"
     DEFAULT_APP_IDENTITY_PLIST_VALUE="official"
     ;;
   *)
@@ -85,6 +85,20 @@ RUN_APP_BUNDLE="$APP_BUNDLE"
 if [[ "$INSTALL_TO_APPLICATIONS" == "1" && "$SIGNING_MODE" == "developer-id" && "${AI_READER_ALLOW_DEVELOPER_ID_INSTALL:-0}" != "1" ]]; then
   echo "error: refusing to install a Developer ID build over the local app because it changes the macOS Accessibility trust identity." >&2
   echo "       Use script/package_release.sh for distributable artifacts, or set AI_READER_ALLOW_DEVELOPER_ID_INSTALL=1 intentionally." >&2
+  exit 2
+fi
+
+if [[ "$INSTALL_TO_APPLICATIONS" == "1" && "$APP_VARIANT" == "official" && "$SIGNING_MODE" != "developer-id" && "${AI_READER_ALLOW_OFFICIAL_DEV_INSTALL:-0}" != "1" ]]; then
+  echo "error: refusing to install an official-looking $SIGNING_MODE build to $INSTALL_DIR/$APP_BUNDLE_NAME.app." >&2
+  echo "       Official installs must come from Developer ID release packaging so macOS Accessibility trust follows the public app." >&2
+  echo "       Use script/package_release.sh, set AI_READER_INSTALL_TO_APPLICATIONS=0 for inspection, or set AI_READER_ALLOW_OFFICIAL_DEV_INSTALL=1 intentionally." >&2
+  exit 2
+fi
+
+if [[ "$INSTALL_TO_APPLICATIONS" == "1" && "$APP_VARIANT" != "official" && ("$APP_BUNDLE_NAME" == "AI Reader" || "$BUNDLE_ID" == "com.hapticasensorics.AIReader") && "${AI_READER_ALLOW_OFFICIAL_DEV_INSTALL:-0}" != "1" ]]; then
+  echo "error: refusing to install a non-official build using the public app name or bundle id." >&2
+  echo "       Keep local builds on AI Reader Dev/com.hapticasensorics.AIReader.dev so stale dev apps cannot masquerade as the release app." >&2
+  echo "       Set AI_READER_INSTALL_TO_APPLICATIONS=0 for inspection, or AI_READER_ALLOW_OFFICIAL_DEV_INSTALL=1 intentionally." >&2
   exit 2
 fi
 
@@ -212,6 +226,21 @@ permission_probe_from_bundle() {
   exit 1
 }
 
+text_capture_probe_from_bundle() {
+  local probe_file="$DIST_DIR/$APP_EXECUTABLE_NAME-text-capture-probe.txt"
+  rm -f "$probe_file"
+  /usr/bin/open -n "$RUN_APP_BUNDLE" --args --text-capture-probe-file "$probe_file"
+  for _ in {1..50}; do
+    if [[ -f "$probe_file" ]]; then
+      cat "$probe_file"
+      return
+    fi
+    sleep 0.1
+  done
+  echo "error: text capture probe did not write $probe_file" >&2
+  exit 1
+}
+
 run_app_binary() {
   AI_READER_PROJECT_ROOT="$PROJECT_ROOT_VALUE" "$RUN_APP_BUNDLE/Contents/MacOS/$APP_EXECUTABLE_NAME" "$@"
 }
@@ -257,6 +286,12 @@ case "$MODE" in
   --clipboard-probe|clipboard-probe)
     run_app_binary --clipboard-probe
     ;;
+  --text-capture-probe|text-capture-probe)
+    text_capture_probe_from_bundle
+    ;;
+  --direct-selection-probe|direct-selection-probe|--selected-text-probe|selected-text-probe)
+    run_app_binary --direct-selection-probe
+    ;;
   --tts-probe|tts-probe)
     run_app_binary --tts-probe
     ;;
@@ -273,7 +308,7 @@ case "$MODE" in
     run_app_binary --launch-at-login-unregister-probe
     ;;
   *)
-    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify|--request-accessibility|--permission-probe|--shortcut-probe|--clipboard-probe|--tts-probe|--playback-seek-probe|--launch-at-login-probe|--launch-at-login-register-probe|--launch-at-login-unregister-probe]" >&2
+    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify|--request-accessibility|--permission-probe|--shortcut-probe|--clipboard-probe|--text-capture-probe|--direct-selection-probe|--tts-probe|--playback-seek-probe|--launch-at-login-probe|--launch-at-login-register-probe|--launch-at-login-unregister-probe]" >&2
     echo "       AI_READER_APP_IDENTITY=permission-test|stable-dev|official $0" >&2
     exit 2
     ;;
