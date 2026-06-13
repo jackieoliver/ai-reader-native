@@ -82,6 +82,12 @@ APP_BINARY="$APP_MACOS/$APP_EXECUTABLE_NAME"
 INFO_PLIST="$APP_CONTENTS/Info.plist"
 RUN_APP_BUNDLE="$APP_BUNDLE"
 
+if [[ "$INSTALL_TO_APPLICATIONS" == "1" && "$SIGNING_MODE" == "developer-id" && "${AI_READER_ALLOW_DEVELOPER_ID_INSTALL:-0}" != "1" ]]; then
+  echo "error: refusing to install a Developer ID build over the local app because it changes the macOS Accessibility trust identity." >&2
+  echo "       Use script/package_release.sh for distributable artifacts, or set AI_READER_ALLOW_DEVELOPER_ID_INSTALL=1 intentionally." >&2
+  exit 2
+fi
+
 plist_escape() {
   local value="$1"
   value="${value//&/&amp;}"
@@ -187,6 +193,25 @@ open_app() {
   /usr/bin/open -n "$RUN_APP_BUNDLE"
 }
 
+request_accessibility_from_bundle() {
+  /usr/bin/open -n "$RUN_APP_BUNDLE" --args --request-accessibility
+}
+
+permission_probe_from_bundle() {
+  local probe_file="$DIST_DIR/$APP_EXECUTABLE_NAME-permission-probe.txt"
+  rm -f "$probe_file"
+  /usr/bin/open -n "$RUN_APP_BUNDLE" --args --permission-probe-file "$probe_file"
+  for _ in {1..50}; do
+    if [[ -f "$probe_file" ]]; then
+      cat "$probe_file"
+      return
+    fi
+    sleep 0.1
+  done
+  echo "error: permission probe did not write $probe_file" >&2
+  exit 1
+}
+
 run_app_binary() {
   AI_READER_PROJECT_ROOT="$PROJECT_ROOT_VALUE" "$RUN_APP_BUNDLE/Contents/MacOS/$APP_EXECUTABLE_NAME" "$@"
 }
@@ -220,6 +245,12 @@ case "$MODE" in
     sleep 1
     pgrep -x "$APP_EXECUTABLE_NAME" >/dev/null
     ;;
+  --request-accessibility|request-accessibility)
+    request_accessibility_from_bundle
+    ;;
+  --permission-probe|permission-probe)
+    permission_probe_from_bundle
+    ;;
   --shortcut-probe|shortcut-probe)
     run_app_binary --shortcut-probe
     ;;
@@ -242,7 +273,7 @@ case "$MODE" in
     run_app_binary --launch-at-login-unregister-probe
     ;;
   *)
-    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify|--shortcut-probe|--clipboard-probe|--tts-probe|--playback-seek-probe|--launch-at-login-probe|--launch-at-login-register-probe|--launch-at-login-unregister-probe]" >&2
+    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify|--request-accessibility|--permission-probe|--shortcut-probe|--clipboard-probe|--tts-probe|--playback-seek-probe|--launch-at-login-probe|--launch-at-login-register-probe|--launch-at-login-unregister-probe]" >&2
     echo "       AI_READER_APP_IDENTITY=permission-test|stable-dev|official $0" >&2
     exit 2
     ;;

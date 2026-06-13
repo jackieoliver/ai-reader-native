@@ -9,10 +9,18 @@ struct AIReaderApp: App {
   @StateObject private var controller = ReaderController()
 
   init() {
+    if let outputURL = Self.permissionProbeOutputURL(from: CommandLine.arguments) {
+      Self.runPermissionProbe(outputURL: outputURL)
+    }
+
     if CommandLine.arguments.contains("--request-accessibility") {
       NSApplication.shared.setActivationPolicy(.regular)
       NSApplication.shared.activate(ignoringOtherApps: true)
       let granted = PermissionService.requestAccessibility()
+      if !granted,
+        let url = URL(string: PermissionService.accessibilitySettingsURL) {
+        NSWorkspace.shared.open(url)
+      }
       print("accessibility_granted=\(granted)")
       exit(granted ? EXIT_SUCCESS : EXIT_FAILURE)
     }
@@ -56,6 +64,48 @@ struct AIReaderApp: App {
       Label(controller.status.title, systemImage: controller.status.systemImage)
     }
     .menuBarExtraStyle(.menu)
+  }
+
+  private static func permissionProbeOutputURL(from arguments: [String]) -> URL? {
+    guard let flagIndex = arguments.firstIndex(of: "--permission-probe-file") else {
+      return nil
+    }
+    let pathIndex = arguments.index(after: flagIndex)
+    guard pathIndex < arguments.endIndex else {
+      return nil
+    }
+    return URL(fileURLWithPath: arguments[pathIndex])
+  }
+
+  private static func runPermissionProbe(outputURL: URL) -> Never {
+    let snapshot = PermissionService.snapshot()
+    let monitor = ModifierTapHotkeyMonitor()
+    let hotkeyStarted = monitor.start()
+    let hotkeyError = monitor.status.lastError ?? ""
+    if hotkeyStarted {
+      monitor.stop()
+    }
+
+    let lines = [
+      "bundle_url=\(Bundle.main.bundleURL.path)",
+      "bundle_identifier=\(Bundle.main.bundleIdentifier ?? "unknown")",
+      "accessibility_trusted=\(snapshot.accessibilityTrusted)",
+      "hotkey_start_ready=\(hotkeyStarted)",
+      "hotkey_start_error=\(hotkeyError)",
+    ]
+    let body = lines.joined(separator: "\n") + "\n"
+    do {
+      try FileManager.default.createDirectory(
+        at: outputURL.deletingLastPathComponent(),
+        withIntermediateDirectories: true
+      )
+      try body.write(to: outputURL, atomically: true, encoding: .utf8)
+      exit(EXIT_SUCCESS)
+    } catch {
+      print("permission_probe_write_failed=\(error.localizedDescription)")
+      fflush(stdout)
+      exit(EXIT_FAILURE)
+    }
   }
 
   private static func runShortcutProbe() -> Never {
