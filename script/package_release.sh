@@ -190,7 +190,10 @@ else
   echo "warning: Gatekeeper assessment did not accept the DMG. This candidate is not approved for public release." >&2
 fi
 
-/usr/bin/shasum -a 256 "$DMG_PATH" | tee "$DMG_PATH.sha256"
+(
+  cd "$(dirname "$DMG_PATH")"
+  /usr/bin/shasum -a 256 "$(basename "$DMG_PATH")"
+) | tee "$DMG_PATH.sha256"
 
 if [[ "$PUBLIC_RELEASE" == "1" ]]; then
   echo "public_release_ready=1"
