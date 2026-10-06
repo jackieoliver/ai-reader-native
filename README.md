@@ -82,16 +82,17 @@ twice to read it, or Control+Option to summarize and read it.
 
 The original 13 development commits and four version tags are preserved here,
 with shared-account author/committer metadata corrected to Jackie Oliver.
-Reattribution changes commit identifiers; file contents and development dates
-were preserved. Original AI co-author trailers remain in commit messages.
+Commit identifiers changed during authorship correction and privacy filtering.
+Development dates and code history are retained; debugging screenshots and local
+Codex metadata were removed from every commit. Original AI co-author trailers remain.
 
 Useful milestones:
 
-- [Initial application](https://github.com/jackieoliver/ai-reader/commit/bd8a03c).
-- [Streaming lifecycle overhaul](https://github.com/jackieoliver/ai-reader/commit/138ef85): overlapping reads, stop behavior, connection lifetime, and playback state.
-- [Build-time bundle configuration](https://github.com/jackieoliver/ai-reader/commit/2af874f): configure the project path before signing.
-- [Accessibility regression fix](https://github.com/jackieoliver/ai-reader/commit/4fe84c5).
-- [Checksum after stapling](https://github.com/jackieoliver/ai-reader/commit/5bf3185): hash the final distributed artifact.
+- [Initial application](https://github.com/jackieoliver/ai-reader-native/commit/e2a3763).
+- [Streaming lifecycle overhaul](https://github.com/jackieoliver/ai-reader-native/commit/229efdb): overlapping reads, stop behavior, connection lifetime, and playback state.
+- [Build-time bundle configuration](https://github.com/jackieoliver/ai-reader-native/commit/13d3d65): configure the project path before signing.
+- [Accessibility regression fix](https://github.com/jackieoliver/ai-reader-native/commit/b153e5f).
+- [Checksum after stapling](https://github.com/jackieoliver/ai-reader-native/commit/c0c2f05): hash the final distributed artifact.
 
 ## Validation and limits
 
@@ -103,3 +104,5 @@ During the October 6, 2026 documentation pass, `swift test` stopped at a
 `PackageDescription` linker error in the installed command-line toolchain, before
 app code or tests compiled. The current suite was not verified in that environment.
 Live provider playback and signed-release installation were not rerun in that pass.
+
+[Publication scope](PUBLICATION.md) documents the privacy boundary.
